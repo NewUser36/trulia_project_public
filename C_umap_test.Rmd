@@ -1,0 +1,194 @@
+---
+title: "umap_test.Rmd"
+date: "11/10/2021"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+header-includes:
+   - \usepackage{xcolor}
+   - \newcommand*{\red}[1]{\textcolor{red}{#1}}
+   - \newcommand*{\blue}[1]{\textcolor{blue}{#1}}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+# Setup
+
+```{r}
+# global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+# R packages
+library(tidyverse); library(magrittr); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(umap)
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+'%not in%' <- Negate('%in%')
+
+df_tfidf_99 <- read_feather("embeddings/tfidf_99.feather")
+df_ft <- read_feather("embeddings/fasttext.feather")
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+
+# Somes homes have been on sale for 7+ years, which I find highly unprobable
+df_bbu <- df_bbu %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+```
+
+# UMAP
+
+https://pair-code.github.io/understanding-umap/ : 
+
+## Hyperparameters
+
+* As `n_neighbors` increases, UMAP connects more and more neighboring points when constructing the graph representation of the high-dimensional data, which leads to a projection that more accurately reflects the global structure of the data [but that looses fine details]. At very low values, any notion of global structure is almost completely lost [in favor of local structure]. 
+* As the `min_dist` parameter increases, UMAP tends to "spread out" the projected points, leading to decreased clustering of the data and less emphasis on global structure.
+
+## How to (mis)read UMAP
+
+### 1. Hyperparameters really matter
+
+Choosing good values isn't easy, and depends on both the data and your goals (eg, how tightly packed the projection ought to be). This is where UMAP's speed is a big advantage - By running UMAP multiple times with a variety of hyperparameters, you can get a better sense of how the projection is affected by its parameters.
+
+### 2. Cluster sizes in a UMAP plot mean nothing
+
+Just as in t-SNE, the size of clusters relative to each other is essentially meaningless. This is because UMAP uses local notions of distance to construct its high-dimensional graph representation.
+
+### 3. Distances between clusters might not mean anything
+
+Likewise, the distances between clusters is likely to be meaningless. While it's true that the global positions of clusters are better preserved in UMAP, the distances between them are not meaningful. Again, this is due to using local distances when constructing the graph.
+
+### 4. Random noise doesn’t always look random.
+
+Especially at low values of `n_neighbors`, spurious clustering can be observed.
+
+### 5. You may need more than one plot
+
+Since the UMAP algorithm is stochastic, different runs with the same hyperparameters can yield different results. Additionally, since the choice of hyperparameters is so important, it can be very useful to run the projection multiple times with various hyperparameters.
+
+## Hyperparameters in R
+
+- n_neighbors: integer; number of nearest neighbors
+- n_components: integer; dimension of target (output) space \blue{(2 for plotting, more for cox models)}
+- metric: character or function; determines how distances between data points are computed. \blue{(Notabliy, euclidian, manhattan and cosine are available. In python, it is possible to define our own metric, I think this is also doable in R. Maybe we could use embeddings and other variables to compute distance (e.g. Gower dissimilarity))}
+- min_dist: numeric; determines how close points appear in the final layout
+
+# Function to plot UMAP object
+
+```{r}
+plot_umap <- function(umap_object, df, time=NULL){
+  #' Adapted from https://cran.r-project.org/web/packages/umap/vignettes/umap.html
+  #' Function generates a ggplot to plot a umap object in 2D.
+  #'
+  #' @param umap_object object generated with umap::umap function
+  #'
+  #' @return p : ggplot
+  
+  # layout contains the coordinates
+  layout = umap_object
+  if (is(umap_object, "umap")) {
+   layout = umap_object$layout
+  }
+  
+  event <- as.factor(df$event)
+  
+  df_plot <- data.frame(layout, event)
+  
+  p <- ggplot(df_plot) +
+    geom_point(aes(x=X1, y=X2, color=event)) + 
+    labs(title="UMAP visualization",
+         subtitle=paste0(
+                   "n_neighbors=", umap_object$config$n_neighbors, "."
+                   ," min_dist=", umap_object$config$min_dist, "."
+                   ," metric=", umap_object$config$metric, "."
+                   ," random_state=", umap_object$config$random_state, "."
+                   ," time:", time
+                   )
+            )
+  
+  return(p)
+}
+```
+
+
+# PCA with transformers embeddings
+
+```{r}
+pca_bbu <- df_bbu %>%
+  subset(select=V1:V728) %>%
+  PCA(., scale.unit = FALSE, graph = F)
+
+# percentage of explained variance by the first two principal components
+pca_bbu$eig[1:2,2]
+
+pca_bbu %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_bbu$event)))
+```
+
+# UMAP with transformers embeddings
+
+Default parameters in R:
+
+```{r, message=TRUE}
+umap.defaults
+```
+
+```{r}
+umap_bbu <- df_bbu %>%
+  subset(select=V1:V728) %>%
+  umap()
+
+plot_umap(umap_bbu, df_bbu)
+
+
+# with a couple of different hyperparameters:
+n_neighbors <- c(5, 10, 20, 50, 100, 200)
+min_dist <- c(0.001, 0.01, 0.1, 0.25, 0.5, 0.8, 0.99)
+metric <- c("euclidean", "cosine")
+random_state=1
+
+for (neighbor in n_neighbors){
+  for (dist in min_dist){
+    for (metric1 in metric){
+      
+      t1 = Sys.time()
+      
+      umap_bbu <- df_bbu %>%
+        subset(select=V1:V728) %>%
+        umap(n_neighbors=neighbor
+             ,min_dist=dist
+             ,metric=metric1
+             ,random_state=random_state)
+
+      t2 = Sys.time()
+      compute_time <- t2 - t1
+
+      plot_umap(umap_bbu, df_bbu, time=compute_time) %>%
+        plot()
+    }
+  }
+}
+```
+
+# Sources
+
+- [High level overview](https://pair-code.github.io/understanding-umap/)
+- [UMAP's parameters explained](https://umap-learn.readthedocs.io/en/latest/parameters.html)
+- [Vignette of R's implementation of UMAP](https://cran.r-project.org/web/packages/umap/vignettes/umap.html)
+- [Documentation of UMAP (R)](https://cran.r-project.org/web/packages/umap/umap.pdf) 
+- [Document embeddings using tf-idf and UMAP](https://umap-learn.readthedocs.io/en/latest/document_embedding.html#using-tf-idf) \red{They use the Hellinger distance "which measures similarity between two probability distribution".}
+- [Might be interesting : AlignedUMAP for Time Varying Data](https://umap-learn.readthedocs.io/en/latest/aligned_umap_politics_demo.html)

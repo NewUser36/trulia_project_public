@@ -1,0 +1,635 @@
+---
+title: "corrupt_texts + 5% typos"
+output:
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+options(digits=4)
+```
+
+The objective in this document is to see how the cox models performe when the text is degraded. The text has been degraded by removing pronouns, proper nouns, numbers, determinants, adding spaces in front of every punctuation and convert text to lowercase (see file corrupting_texts.Rmd for details). 
+
+We first compute performance for models with the standard variables (listed price, number of bathrooms, etc.) and the text, and then we create models with only the text as covariates.
+
+```{r}
+####################
+# global variables #
+####################
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+###########
+# R setup #
+###########
+library(tidyverse); library(magrittr); library(survival); library(survminer); library(R.utils); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(riskRegression); library(pec); library(survAUC); library(glmnet); library(plotmo); library(quanteda); 
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+# R.utils : to insert elements to a vector. If not available, try to use "append", but insert is more flexible
+
+# My functions
+source("utils.R")
+source('generate_embeddings.R')
+'%not in%' <- Negate('%in%')
+
+# glmnet hyperparameters
+glmnet.control(mxitnr=50)
+
+################
+# Python setup #
+################
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+
+####################
+# Prepare datasets #
+####################
+#TODO: import the right datasets
+df_bbu <- read_feather("embeddings/degraded_texts/10typos/df_bbu_degraded_texts_10typos.feather") %>% as.data.frame()
+df_ft <- read_feather("embeddings/degraded_texts/10typos/df_ft_degraded_texts_10typos.feather")
+
+df_typos <- df_ft %>%
+  select(!c(ft1:ft300))
+
+# Create tf-idf dataset
+my_stopwords <- c(tm::stopwords())
+#TODO : change column "text" to appropriate column
+df_tfidf_99 <- df_embeddings(df_typos %>% as.data.frame()
+                       ,text="corrupted_text_10typos"
+                       ,checkpoint="tf-idf"
+                       ,removeNumbers = FALSE 
+                       ,removePunctuation = TRUE 
+                       ,stripWhitespace = TRUE
+                       ,stemming = TRUE
+                       ,tolower = TRUE
+                       ,stopwords = my_stopwords
+                       ,language = 'en'
+                       ,wordLengths = c(3,Inf) # this is the default
+                       ,SparseTermsPercent = 0.99 # remove most words that appear only in 1-SparseTermsPercent of texts
+                       ,normalize_tfidf = TRUE
+                       #,lower_IDF_quantile=0.15
+                       ,low_document_frequency=1
+                       )
+
+#################################################
+# Removing extreme and influential observations #
+#################################################
+# Somes homes have been on sale for 7+ years, which I find highly unprobable
+# Keeping them in the dataset changes significantly results. Considering that
+# they are probably problematic observations, I prefer to remove them.
+df_bbu <- df_bbu %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+df_ft <- df_ft %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+
+df_tfidf_99 <- df_tfidf_99 %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+
+# PCA
+# generating PCA coordinated for bert embeddings
+pca_bbu <- df_bbu %>%
+  select(V1:V768) %>%
+  PCA(., scale.unit = FALSE, graph = F, ncp=768)
+
+# using 80% rule (will be used in coxph later)
+#num_dimension <- length(as.data.frame(pca_bbu$eig)$'cumulative percentage of variance'[as.data.frame(pca_bbu$eig)$'cumulative percentage of variance' <= 80]) + 1 
+num_dimension <- 300
+
+pca_bbu_coord <- data.frame(pca_bbu$ind$coord)
+colnames(pca_bbu_coord) <- paste0("bbu_dim.", 1:768)
+df_bbu_pca <- cbind(df_bbu, pca_bbu_coord)
+
+# merging df
+df <- left_join(df_tfidf_99, df_ft) %>%
+  left_join(., df_bbu_pca)
+
+# REMARK : 
+# For the function extract_nonzero_coeff to work, variables treated as
+# factors must be transformed as factor here
+df <- df %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+     year_built = as.numeric(year_built)
+    ,num_bath = as.numeric(num_bath)
+    ,num_bed = as.numeric(num_bed)
+    ,living_area = as.numeric(living_area)
+    ,lot_area = as.numeric(lot_area)
+    ,listed_date = lubridate::date(listed_date)
+    ,sold_date = lubridate::date(sold_date)
+    ,I_heating = as.factor(I_heating)
+    ,I_cooling = as.factor(I_cooling)
+    ,I_parking = as.factor(I_parking)
+    ,I_outdoor = as.factor(I_outdoor)
+    ,I_pool = as.factor(I_pool)
+    ,I_type = as.factor(I_type)
+    ,event = as.numeric(event)
+  ) %>%
+  # need to have no spaces in categories for regex
+  mutate(
+    I_heating = recode(I_heating, "No Info" = "No_Info")
+    , I_cooling = recode(I_cooling, "No Info" = "No_Info")
+    , I_parking = recode(I_parking, "No Info" = "No_Info")
+    , I_outdoor = recode(I_outdoor, "No Info" = "No_Info") 
+    , I_pool = recode(I_pool, "No Info" = "No_Info")
+    , I_type = recode(I_type, "No Info" = "No_Info")
+  )
+
+# train-test-split
+split <- train_valid_test(df, "event", p_train = 0.8, p_valid = 0.1)
+train <- split$train$df
+valid <- split$valid$df
+test <- split$test$df
+
+# After some thoughts, I don't think I will use a test set, so I will
+# merge valid and test to make a bigger validation set set
+test <- rbind(valid, test)
+rm(valid)
+```
+
+
+# Structured variables + texts
+
+## Bert
+
+```{r}
+# bert-base-uncased and PCA
+Formula <- as.formula(paste("Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("bbu_dim.", 1:num_dimension, collapse="+", sep="")))
+# remark : doesn't work with 768
+
+full_pca_bbu <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full_pca_bbu)
+score_cox_full_pca_bbu <- performance_measures(full_pca_bbu, train, test, surv_call="Surv(sale_time, event)")
+
+# concordance index
+cv_pca_bbu_Cindex <- cv.glmnet(x=full_pca_bbu$x, y=full_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+cv_pca_bbu_Cindex %>% plot()
+
+# loglik
+cv_pca_bbu_loglik <- cv.glmnet(x=full_pca_bbu$x, y=full_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+cv_pca_bbu_loglik %>% plot()
+
+# Reevaluating models with coefficients
+embedding_names <- paste("bbu_dim.", 1:num_dimension, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+
+score_cox_pca_bbu_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_pca_bbu_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+score_cox_pca_bbu_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_pca_bbu_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+```
+
+## fasttext
+
+```{r}
+Formula <- as.formula(paste("Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("ft", 1:300, collapse="+", sep="")))
+
+full_ft <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full_ft)
+
+score_cox_full_ft <- performance_measures(full_ft, train, test, surv_call="Surv(sale_time, event)")
+
+cv_pca_ft_Cindex <- cv.glmnet(x=full_ft$x, y=full_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_ft_Cindex)
+
+cv_pca_ft_loglik <- cv.glmnet(x=full_ft$x, y=full_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_ft_loglik)
+
+embedding_names <- paste("ft", 1:300, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+
+score_cox_ft_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_pca_ft_Cindex 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+score_cox_ft_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_pca_ft_loglik 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+```
+
+## tfidf
+
+The tf-idf matrix does not change from the tf-idf we had with the original texts. So, I will remove words that are too frequent to see if the final performance is different (total of 957 variables instead of 1122)
+
+```{r}
+# Performance
+words <- colnames(df_tfidf_99)[28:length(colnames(df_tfidf_99))]
+
+Formula <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words, collapse="+", sep="")))
+
+# as shown in the appendix, I can extract the design matrix that needs to be
+# given to glmnet using a linear model. I do this because there are too many
+# variables to adjust the model for coxph
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words, collapse="+", sep="")))
+
+linear <- lm(formula_lr, data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(sale_time, event))
+
+cv_tfidf99_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25
+               )
+plot(cv_tfidf99_Cindex)
+
+
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+score_cox_tfidf99_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+cv_tfidf99_loglik <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25
+               ) # many convergence issues
+#plot(cv_tfidf99_loglik)
+
+score_cox_tfidf99_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+```
+
+
+
+# Texts only
+
+## Bert
+
+```{r}
+Formula <- as.formula(paste("Surv(sale_time, event) ~", paste("bbu_dim.", 1:num_dimension, collapse="+", sep="")))
+# remark : doesn't work with 768
+
+# model without regularization
+text_pca_bbu <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(text_pca_bbu)
+score_text_full_pca_bbu <- performance_measures(text_pca_bbu, train, test, surv_call="Surv(sale_time, event)")
+
+# concordance index
+text_cv_pca_bbu_Cindex <- cv.glmnet(x=text_pca_bbu$x, y=text_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+coef(text_cv_pca_bbu_Cindex, s="lambda.1se")
+text_cv_pca_bbu_Cindex %>% plot()
+
+# loglik
+text_cv_pca_bbu_loglik <- cv.glmnet(x=text_pca_bbu$x, y=text_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+text_cv_pca_bbu_loglik %>% plot()
+
+# Reevaluating models with coefficients
+embedding_names <- paste("bbu_dim.", 1:num_dimension, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("")
+
+model_text_bbu_Cindex <- generate_newcox_glmnet(cvglmnet = text_cv_pca_bbu_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )$cox
+model_text_bbu_Cindex %>% summary()
+
+score_text_pca_bbu_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = text_cv_pca_bbu_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+score_text_pca_bbu_regularized_loglik <- performance_newcox_glmnet(cvglmnet = text_cv_pca_bbu_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+# for comparison, performance of the  model without regularization
+scores_text_bbu = performance_measures(model=text_pca_bbu, olddata=train, newdata=test,surv_call="Surv(sale_time, event)") # takes more time to run, so in terms of performance/time, it might not be the best (same for fasttext without regularization). Instead of taking 1 minute, it takes several minutes.
+# but what takes time is the bootstrap C-index, so maybe the full model isn't too bad.
+```
+
+
+
+## fasttext
+
+```{r}
+Formula <- as.formula(paste("Surv(sale_time, event) ~", paste("ft", 1:300, collapse="+", sep="")))
+# full model without regularization
+text_ft <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(text_ft)
+
+score_text_full_ft <- performance_measures(text_ft, train, test, surv_call="Surv(sale_time, event)")
+
+text_cv_pca_ft_Cindex <- cv.glmnet(x=text_ft$x, y=text_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+plot(text_cv_pca_ft_Cindex)
+
+text_cv_pca_ft_loglik <- cv.glmnet(x=text_ft$x, y=text_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-50
+               )
+plot(text_cv_pca_ft_loglik)
+
+embedding_names <- paste("ft", 1:300, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("")
+
+model_text_ft_Cindex <- generate_newcox_glmnet(cvglmnet = text_cv_pca_ft_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )$cox
+model_text_ft_Cindex %>% summary()
+
+score_text_ft_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = text_cv_pca_ft_Cindex 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+score_text_ft_regularized_loglik <- performance_newcox_glmnet(cvglmnet = text_cv_pca_ft_loglik 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+
+scores_text_ft = performance_measures(model=text_ft, olddata=train, newdata=test,surv_call="Surv(sale_time, event)")
+```
+
+## tfidf
+
+```{r}
+words <- colnames(df_tfidf_99)[28:length(colnames(df_tfidf_99))]
+
+# I can extract the design matrix that needs to be
+# given to glmnet using a linear model. I do this because there are too many
+# variables to adjust the model for coxph
+#formula_lr <- as.formula(paste("event ~ ", paste(words, collapse="+", sep="")))
+
+linear <- lm(as.formula(paste("event ~ ", paste(words, collapse="+", sep=""))), data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(sale_time, event))
+
+text_cv_tfidf99_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25 # 25 instead of 50 gives more lambdas tested
+               )
+plot(text_cv_tfidf99_Cindex)
+
+variables_names <- c("")
+score_text_tfidf99_regularized_Cindex <- performance_newcox_glmnet(
+  cvglmnet = text_cv_tfidf99_Cindex
+  ,variables_names=variables_names
+  ,embedding_names=words
+  ,dataset=train
+  ,dataset_test = test
+  ,surv_call="Surv(sale_time, event)"
+  )
+
+text_cv_tfidf99_loglik <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+                #, lambda.min.ratio = 0.1e-25 # # 25 instead of 50 gives more lambdas tested
+               )
+plot(text_cv_tfidf99_loglik)
+
+score_text_tfidf99_regularized_loglik <- performance_newcox_glmnet(
+  cvglmnet = text_cv_tfidf99_loglik
+  ,variables_names=variables_names
+  ,embedding_names=words
+  ,dataset=train
+  ,dataset_test = test
+  ,surv_call="Surv(sale_time, event)"
+                      )
+```
+
+# Structured data and texts
+
+```{r}
+score_cox_full_pca_bbu # model without regularization
+score_cox_pca_bbu_regularized_Cindex$scores
+score_cox_pca_bbu_regularized_Cindex$number_of_variables
+score_cox_pca_bbu_regularized_loglik$scores
+score_cox_pca_bbu_regularized_loglik$number_of_variables
+
+score_cox_full_ft # model without regularization
+score_cox_ft_regularized_Cindex$scores
+score_cox_ft_regularized_Cindex$number_of_variables
+score_cox_ft_regularized_loglik$scores
+score_cox_ft_regularized_loglik$number_of_variables
+
+score_cox_tfidf99_regularized_Cindex$scores
+score_cox_tfidf99_regularized_Cindex$number_of_variables
+score_cox_tfidf99_regularized_loglik$scores
+score_cox_tfidf99_regularized_loglik$number_of_variables
+```
+
+
+# Text only
+
+```{r}
+score_text_full_pca_bbu # model without regularization
+score_text_pca_bbu_regularized_Cindex$scores
+score_text_pca_bbu_regularized_Cindex$number_of_variables
+score_text_pca_bbu_regularized_loglik$scores
+score_text_pca_bbu_regularized_loglik$number_of_variables
+
+score_text_full_ft # model without regularization
+score_text_ft_regularized_Cindex$scores
+score_text_ft_regularized_Cindex$number_of_variables
+score_text_ft_regularized_loglik$scores
+score_text_ft_regularized_loglik$number_of_variables
+
+score_text_tfidf99_regularized_Cindex$scores
+score_text_tfidf99_regularized_Cindex$number_of_variables
+score_text_tfidf99_regularized_loglik$scores
+score_text_tfidf99_regularized_loglik$number_of_variables
+```
+
+# Comparing length of texts after tokenization (BERT)
+
+```{r}
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+transformers = reticulate::import('transformers')
+
+checkpoint <- "bert-base-uncased"
+tokenizer <- transformers$BertTokenizer$from_pretrained(checkpoint)
+tokenized_length <- sapply(df$description_cased, trf_count_length, tokenizer, USE.NAMES=FALSE)
+tokenized_length_corrupt <- sapply(df$corrupted_text_10typos, trf_count_length, tokenizer, USE.NAMES=FALSE)
+
+text_length <- c(tokenized_length, tokenized_length_corrupt)
+text_type <- c(rep("original", length(tokenized_length)), rep("modifications (*), p=0.10", length(tokenized_length_corrupt))) %>% as.factor()
+tokenized_texts_length <- data.frame(text_length, text_type)
+
+length_bar_density <- ggplot(tokenized_texts_length, aes(y = ..count.., x=text_length, fill=text_type)) +
+  geom_bar(alpha = 0.5, position="identity") +
+  geom_density(aes(y=1*..count.., colour=text_type), alpha = 0.01) +
+  guides(colour="none") +
+  geom_vline(xintercept=512, color="red") +
+  labs(fill="Texte") +
+  xlab("Longueur du texte après tokenisation") +
+  ylab("Fréquence") +
+  #scale_x_continuous(breaks = round(seq(min(tokenized_texts_length$text_length), max(tokenized_texts_length$text_length), by = 100),1)) +
+  theme_bw()
+length_bar_density
+# ggsave("results/plots/tokenized_text_10typos_bar_density.png", length_bar_density
+#       ,scale=1
+#       ,width=6
+#       ,height=3)
+
+# number of observatiosn with text length > 512
+g512 <- tokenized_length>512
+sum(tokenized_length>512)
+sum(tokenized_length_corrupt>512)
+
+#######
+diff <- tokenized_length - tokenized_length_corrupt %>%
+  data.frame()
+colnames(diff) <- "diff"
+diff[g512] %>% hist() # plus la différence est élevée, plus BERT a du nouveau matériel pour bien performer
+
+texts_g512= subset(df, subset=g512, select=c("description_cased"))
+
+diff_length_hist <- ggplot(subset(diff, subset=g512), aes(y = ..count.., x=diff)) +
+  geom_histogram(col = "black", alpha = 0.5, bins = 15) +
+  labs(fill="Texte") +
+  xlab("Différence en longueur du texte après tokenisation") +
+  ylab("Proportion") +
+  theme_bw()
+diff_length_hist
+# ggsave("results/plots/diff_tokenized_text_length.png", diff_length_hist
+#       ,scale=1
+#       ,width=6
+#       ,height=3)
+```

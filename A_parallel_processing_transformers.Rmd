@@ -1,0 +1,525 @@
+---
+title: "parallel_processing_transformers selection and performance"
+output:
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+header-includes:
+   - \usepackage{xcolor}
+   - \newcommand*{\red}[1]{\textcolor{red}{#1}}
+   - \newcommand*{\blue}[1]{\textcolor{blue}{#1}}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+This notebook is to try to take advantage of parallel processing when generating word embeddings from transformers. In the `exploration.Rmd` file, generating embeddings from BERT for 7543 texts of varying lenghts took my computer 1.5 days. I would like to make this faster.
+
+# Sources on (CPU) parallel computing in R
+
+- https://stt4230.rbind.io//autre_materiel/calcul_parallele_r_2017.pdf (theoretical explanation and examples)
+- https://www.r-bloggers.com/2018/09/simple-parallel-processing-in-r/ (quick intro)
+- https://stackoverflow.com/questions/18588896/custom-package-using-parallel-or-doparallel-for-multiple-os-as-a-cran-package
+- https://www.reddit.com/r/rstats/comments/56agd1/comment/d8ikc41/?utm_source=share&utm_medium=web2x&context=3
+
+After a quick morning reasearching parallel computing packages in R, I found two packages that seem pretty simple to use :
+1. `parallel` : make use of functions similar to `sapply` to parallelize an apply-like function call.
+2. `doParallel` : make use of a function called `foreach`, which I think comes from the `foreach` package,
+3. `future` looks good too...
+
+For what it's worth, `jmbayes` uses `doParallel`.
+
+Since a lot of the functions I've written already use sapply or lapply, `parallel` is probably easier to use, but I think `doParallel` is a little bit better, since one do not need to transfer a dataset into the cluster environment.
+
+Results :
+
+1. `parallel` does not work
+2. `doParallel` kind of works, but as explained on [stackoverflow](https://stackoverflow.com/questions/58507084/parallel-processing-in-r-calling-reticulate-python-function/64840090#64840090), it is necessary to call transformers and reticulate in every cluster ([source](https://stackoverflow.com/a/58511148)), which takes up more RAM, and makes this unusable (32gb of ram and 4gb of swap memory is not enough to generate word embeddings for 30 texts!).
+3. `future` does not work, but I don't know why.
+
+Remark : 
+
+reticulate/Python objects are non-exportable (great explanation [here](https://cran.r-project.org/web/packages/future/vignettes/future-4-non-exportable-objects.html)), which makes paralellization more complicated. This is why `parallel` does not work and also why we have to call reticulate and transformers in every cluster with `doParallel`. 
+
+
+# Setup
+
+```{r}
+# R packages
+library(reticulate)
+library(tidyverse)
+library(docstring) # documentation
+library(pbapply) # progress bar
+library(feather)
+library(microbenchmark) # benchmarking
+library(parallel)
+library(doParallel)
+library(tictoc) # tic() and toc() for time
+
+# Python modules
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+transformers = reticulate::import('transformers')
+np = reticulate::import('numpy')
+
+# setup environment and global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+'%not in%' <- Negate('%in%')
+
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+df <- df_bbu %>%
+  select(-paste0("V", 1:768))
+
+# df is a tibble. My code does not work for tibbles so I have to change it into
+# a dataframe. I should look into converting my code for tibbles since using
+# dataframes in slower...
+df <- as.data.frame(df)
+head(df)
+
+trf_embedding <- function(text, tokenizer, model,
+                          truncation = FALSE,
+                          use_CLS = TRUE, 
+                          layer=12, 
+                          dimension=768){
+  
+  if (dimension != 768){
+    stop("Using dimension != 768 hasn't been implemented yet.")
+  }
+  print("h4eello")
+  encoded_sentence <- text %>%
+    tokenizer$tokenize() %>%
+    tokenizer$encode(., truncation = truncation, return_tensors = 'pt')
+  
+  embeddings = model(encoded_sentence)
+  
+  if (use_CLS){
+    to_return <- embeddings$last_hidden_state$squeeze()[0] # CLS token
+  } else{
+    stop("use_CLS is set to FALSE, but using layers is not implemented yet.")
+  }
+  # convert pytorch tensor to numpy array, which is then converted to a vector
+  to_return <- to_return$detach()$numpy() %>% as.vector()
+  #to_return <- as.vector(to_return)
+  
+  return(to_return) # vector of dim. 1x728
+}
+```
+
+# Original functions
+
+To make things simpler, I have truncated part of the function `df_embeddings` since I will only need the code for transformer embeddings.
+
+```{r}
+tokenizer <- transformers$BertTokenizer$from_pretrained("bert-base-uncased")
+model <- transformers$BertModel$from_pretrained("bert-base-uncased")
+
+df_embeddings <- function(df, text, checkpoint="bert-base-uncased", ..., 
+                          dimension=NULL, 
+                          dimension_reduction=NULL){
+  #' Ajoute l'embedding des textes au dataframe.
+  #'
+  #' @param df data.frame. Dataset qui contient les donnees structurees et une colonne avec les textes
+  #' @param text string. Nom de la colonne qui contient les textes
+  #' @param checkpoint string. Transformers : bert-base-uncased (en seulement), camembert (fr seulement), xlm-enfr (fr et en). fastText : fasttext (fr seulement)
+  #' @param ... Arguments qui seront passes aux fonctions qui font les embeddings.
+  #' @param dimension integer. Nombre de dimensions des vecteurs
+  #' @param dimension_reduction string. Si dimension != NULL, methode de reduction de la dimensionnalite
+  #'
+  #' @return data.frame. df initial auquel a ete ajoute l'embedding des textes
+
+  # Gestion de la dimension
+  if (is.null(dimension) & checkpoint!="fasttext"){
+    dimension = 768 # dimension par defaut avec BERT-like models
+  } else if (is.null(dimension) & checkpoint=="fasttext"){
+    dimension = 300 # dimension par defaut avec fastText
+  }
+  
+  # Gestion du modele pour les embeddings
+  if (checkpoint %in% c('bert-base-uncased', 'roberta-base')){
+    
+    # it would be easier to use AutoTokenizer, but I've had problems with
+    # it in the past... so I use this condition to import the appropriate model.
+    if (checkpoint == 'bert-base-uncased'){
+      tokenizer <- transformers$BertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$BertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'camembert-base'){
+      tokenizer <- transformers$CamembertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$CamembertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'roberta-base'){
+      tokenizer <- transformers$RobertaTokenizer$from_pretrained('roberta-base')
+      model <- transformers$RobertaModel$from_pretrained('roberta-base')
+    }
+    
+    # sapply retourne un vecteur, plus rapide que lapply
+    # pbsapply : sapply with progress bar
+    embeddings <- sapply(X=df[, text]
+                        ,FUN=trf_embedding
+                        ,model=model 
+                        ,tokenizer=tokenizer
+                        ,...
+                        ) %>%
+                        t() # matrix of dim. nrow(df)x768
+  }
+  
+  # retourne un df avec les dimensions pour chaque texte
+  embeddings_df = data.frame(embeddings)
+
+  # ajout des embeddings au df initial
+  #return(t(embeddings))
+  return(cbind(df, embeddings_df))
+}
+
+microbenchmark({df_embeddings(df[1:3, ], "description_cased", checkpoint="bert-base-uncased", truncation=TRUE)},
+         times=10)
+```
+
+
+
+
+# Package `doParallel` (working, approx 2x faster, but takes too much RAM)
+
+http://pablobarbera.com/ECPR-SC105/code/02-parallel-computing.html gives an example at the end with foreach
+
+foreach vignette https://cran.r-project.org/web/packages/foreach/vignettes/foreach.html
+
+```{r}
+library(doParallel)
+
+cluster <- makeCluster(detectCores() - 4)
+registerDoParallel(cluster)
+
+tic()
+embeddings_foreach <- foreach(i=1:50
+                              , .combine=rbind
+                              , .packages=c("tidyverse")
+                              , .verbose=TRUE) %dopar% {
+
+
+  # error : attempt to apply non-function if the tokenizer and model
+  # are not explicitely loaded (and reticulate and transformers)
+  # maybe because they are python objects??
+  # I have to find a way to load them from the global environment to the cluster
+
+  # https://stackoverflow.com/questions/58507084/parallel-processing-in-r-calling-reticulate-python-function
+
+  reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+  transformers = reticulate::import('transformers')
+  tokenizer <- transformers$BertTokenizer$from_pretrained("bert-base-uncased")
+  model <- transformers$BertModel$from_pretrained("bert-base-uncased")
+
+  trf_embedding(df[i, "description_cased"]
+                ,tokenizer=tokenizer
+                ,model=model
+                ,truncation=TRUE
+                )
+}
+toc()
+
+stopCluster(cluster)
+##################
+```
+
+
+# Package `parallel` (not working)
+
+It is not working, and even if it were working, I think using `doParallel` is a little bit easier
+
+```{r}
+n_cores <- detectCores() # 12 logical cores (this computer has 6 physical cores)
+cluster <- makeCluster(n_cores-1) # 11 logical cores will be used
+clusterExport(cl=cluster, varlist=list("df", "trf_embedding", "transformers", "np"))
+clusterEvalQ(cluster, list(library(tidyverse), library(reticulate)))
+
+df_embeddings_parallel <- function(df, text, checkpoint="bert-base-uncased", ..., 
+                          dimension=NULL, 
+                          dimension_reduction=NULL
+                          ){
+  #' Ajoute l'embedding des textes au dataframe.
+  #'
+  #' @param df data.frame. Dataset qui contient les donnees structurees et une colonne avec les textes
+  #' @param text string. Nom de la colonne qui contient les textes
+  #' @param checkpoint string. Transformers : bert-base-uncased (en seulement), camembert (fr seulement), xlm-enfr (fr et en). fastText : fasttext (fr seulement)
+  #' @param ... Arguments qui seront passes aux fonctions qui font les embeddings.
+  #' @param dimension integer. Nombre de dimensions des vecteurs
+  #' @param dimension_reduction string. Si dimension != NULL, methode de reduction de la dimensionnalite
+  #'
+  #' @return data.frame. df initial auquel a ete ajoute l'embedding des textes
+
+  # Gestion de la dimension
+  if (is.null(dimension) & checkpoint!="fasttext"){
+    dimension = 768 # dimension par defaut avec BERT-like models
+  } else if (is.null(dimension) & checkpoint=="fasttext"){
+    dimension = 300 # dimension par defaut avec fastText
+  }
+  
+  
+  reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+  transformers = reticulate::import('transformers')
+  tokenizer <- transformers$BertTokenizer$from_pretrained("bert-base-uncased")
+  model <- transformers$BertModel$from_pretrained("bert-base-uncased")
+  
+  # Gestion du modele pour les embeddings
+  if (checkpoint %in% c('bert-base-uncased', 'roberta-base')){
+    
+    # it would be easier to use AutoTokenizer, but I've had problems with
+    # it in the past... so I use this condition to import the appropriate model.
+    if (checkpoint == 'bert-base-uncased'){
+      tokenizer <- transformers$BertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$BertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'camembert-base'){
+      tokenizer <- transformers$CamembertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$CamembertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'roberta-base'){
+      tokenizer <- transformers$RobertaTokenizer$from_pretrained('roberta-base')
+      model <- transformers$RobertaModel$from_pretrained('roberta-base')
+    }
+
+    # sapply retourne un vecteur, plus rapide que lapply
+    # pbsapply : sapply with progress bar
+    # load dataset in cluster
+    embeddings <- parSapply(
+      cluster
+      ,X=df[, text]
+      ,FUN=trf_embedding
+      ,model=model
+      ,tokenizer=tokenizer
+      ,...) %>% 
+      t() # matrix of dim. nrow(df)x768
+  }
+  
+  # retourne un df avec les dimensions pour chaque texte
+  embeddings_df = data.frame(embeddings)
+  # ajout des embeddings au df initial
+  #return(t(embeddings))
+  return(cbind(df, embeddings_df))
+}
+df_embeddings_parallel(df[1:3, ], "description_cased", checkpoint="bert-base-uncased", truncation=TRUE)
+
+stopCluster(cluster)
+```
+
+
+
+
+
+
+
+
+
+
+
+# Package future (not working)
+
+Remark 1 [(source)](https://cran.r-project.org/web/packages/future/vignettes/future-4-non-exportable-objects.html)
+
+Certain types of objects are tied to a given R session. Such objects cannot be saved to file by one R process and then later be reloaded in another R process and expected to work correctly. If attempted, we will often get an informative error but not always. For the same reason, these type of objects cannot be exported to another R processes(*) for parallel processing regardless of which parallelization framework we use. We refer to these type of objects as “non-exportable objects”.
+
+(*) The exception might be when forked processes are used, i.e. plan(multicore). However, such attempts to work around the underlying problem, which is non-exportable objects, should be avoided and considered non-stable. Moreover, such code will fail to parallelize when using other future backends.
+
+A [comment on stackoverflow](https://stackoverflow.com/a/64840090) recommends to use the package `future` with `plan(multicore)` to make parallelization work. Unfortunately, it is not usable in RStudio and I can't make it work on my computer (even in R console). More specifically, using `plan(multicore)`, nothing happens in R console. As expected, when using `plan(multicore)` in RStudio, there is no gain in speed because it is not supported; the code is run as if there were no parallelization. Using `plan(multisession)` is not supposed to work, and indeed I get an error message 
+
+Remark 2 [(source)](https://cran.r-project.org/web/packages/future/vignettes/future-1-overview.html)
+
+Multicore Futures
+On operating systems where R supports forking of processes, which is basically all operating system except Windows, an alternative to spawning R sessions in the background is to fork the existing R process.
+
+[P]rocess forking is also considered unstable in some R environments. For instance, when running R from within RStudio process forking may resulting in crashed R sessions. Because of this, the future package disables multicore futures by default when running from RStudio. See help("supportsMulticore") for more details.
+
+```{r}
+######################################################
+# RUN THIS IN R CONSOLE, OR AT LEAST NOT IN R STUDIO #
+######################################################
+library(reticulate)
+library(tidyverse)
+library(docstring) # documentation
+library(pbapply) # progress bar
+library(feather)
+library(microbenchmark) # benchmarking
+library(parallel)
+library(doParallel)
+library(tictoc) # tic() and toc() for time
+
+# Python modules
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+transformers = reticulate::import('transformers')
+np = reticulate::import('numpy')
+
+# setup environment and global variables
+home_directory <- "~/Elements/Universite/Maitrise statistique/trulia_project"
+setwd(home_directory)
+
+'%not in%' <- Negate('%in%')
+
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+df <- df_bbu %>%
+  select(-paste0("V", 1:768))
+
+# df is a tibble. My code does not work for tibbles so I have to change it into
+# a dataframe. I should look into converting my code for tibbles since using
+# dataframes in slower...
+df <- as.data.frame(df)
+head(df)
+
+trf_embedding <- function(text, tokenizer, model,
+                          truncation = FALSE,
+                          use_CLS = TRUE, 
+                          layer=12, 
+                          dimension=768){
+  
+  if (dimension != 768){
+    stop("Using dimension != 768 hasn't been implemented yet.")
+  }
+  print("h4eello")
+  encoded_sentence <- text %>%
+    tokenizer$tokenize() %>%
+    tokenizer$encode(., truncation = truncation, return_tensors = 'pt')
+  
+  embeddings = model(encoded_sentence)
+  
+  if (use_CLS){
+    to_return <- embeddings$last_hidden_state$squeeze()[0] # CLS token
+  } else{
+    stop("use_CLS is set to FALSE, but using layers is not implemented yet.")
+  }
+  # convert pytorch tensor to numpy array, which is then converted to a vector
+  to_return <- to_return$detach()$numpy() %>% as.vector()
+  #to_return <- as.vector(to_return)
+  
+  return(to_return) # vector of dim. 1x728
+}
+
+library(future)
+library("future.apply") # wrapper around future functions
+plan(tweak(multicore, workers=parallel::detectCores()-1))
+
+df_embeddings_future <- function(df, text, checkpoint="bert-base-uncased", ..., 
+                          dimension=NULL, 
+                          dimension_reduction=NULL){
+  #' Ajoute l'embedding des textes au dataframe.
+  #'
+  #' @param df data.frame. Dataset qui contient les donnees structurees et une colonne avec les textes
+  #' @param text string. Nom de la colonne qui contient les textes
+  #' @param checkpoint string. Transformers : bert-base-uncased (en seulement), camembert (fr seulement), xlm-enfr (fr et en). fastText : fasttext (fr seulement)
+  #' @param ... Arguments qui seront passes aux fonctions qui font les embeddings.
+  #' @param dimension integer. Nombre de dimensions des vecteurs
+  #' @param dimension_reduction string. Si dimension != NULL, methode de reduction de la dimensionnalite
+  #'
+  #' @return data.frame. df initial auquel a ete ajoute l'embedding des textes
+
+  # Gestion de la dimension
+  if (is.null(dimension) & checkpoint!="fasttext"){
+    dimension = 768 # dimension par defaut avec BERT-like models
+  } else if (is.null(dimension) & checkpoint=="fasttext"){
+    dimension = 300 # dimension par defaut avec fastText
+  }
+  
+  # Gestion du modele pour les embeddings
+  if (checkpoint %in% c('bert-base-uncased', 'roberta-base')){
+    
+    # it would be easier to use AutoTokenizer, but I've had problems with
+    # it in the past... so I use this condition to import the appropriate model.
+    if (checkpoint == 'bert-base-uncased'){
+      tokenizer <- transformers$BertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$BertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'camembert-base'){
+      tokenizer <- transformers$CamembertTokenizer$from_pretrained(checkpoint)
+      model <- transformers$CamembertModel$from_pretrained(checkpoint)
+    } else if (checkpoint == 'roberta-base'){
+      tokenizer <- transformers$RobertaTokenizer$from_pretrained('roberta-base')
+      model <- transformers$RobertaModel$from_pretrained('roberta-base')
+    }
+    
+    # sapply retourne un vecteur, plus rapide que lapply
+    # pbsapply : sapply with progress bar
+    embeddings <- future_sapply(X=df[, text]
+                        ,FUN=trf_embedding
+                        ,model=model 
+                        ,tokenizer=tokenizer
+                        ,...
+                        ) %>%
+                        t() # matrix of dim. nrow(df)x768
+  }
+  
+  # retourne un df avec les dimensions pour chaque texte
+  embeddings_df = data.frame(embeddings)
+
+  # ajout des embeddings au df initial
+  #return(t(embeddings))
+  return(cbind(df, embeddings_df))
+}
+
+tic()
+df_embeddings_future(df[1:3, ], "description_cased", checkpoint="bert-base-uncased", truncation=TRUE)
+toc()
+
+microbenchmark({df_embeddings_future(df[1:3, ], "description_cased", checkpoint="bert-base-uncased", truncation=TRUE)},
+         times=10)
+```
+
+
+
+
+
+
+
+# Appendix A : bencharmking with foreach
+```{r}
+thisfunction <- function(data){
+  embeddings_foreach <- foreach(i=1:length(data)
+                              , .combine=rbind
+                              , .packages=c("tidyverse")
+                              , .verbose=FALSE) %dopar% {
+
+  # error : attempt to apply non-function if the tokenizer and model
+  # are not explicitely loaded (and reticulate and transformers)
+  # maybe because they are python objects??
+  # I have to find a way to load them from the global environment to the cluster
+
+  # https://stackoverflow.com/questions/58507084/parallel-processing-in-r-calling-reticulate-python-function
+  
+  reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+  transformers = reticulate::import('transformers')
+  tokenizer <- transformers$BertTokenizer$from_pretrained("bert-base-uncased")
+  model <- transformers$BertModel$from_pretrained("bert-base-uncased")
+
+  trf_embedding <- function(text, tokenizer, model,
+                          truncation = FALSE,
+                          use_CLS = TRUE, 
+                          layer=12, 
+                          dimension=768){
+  
+    if (dimension != 768){
+      stop("Using dimension != 768 hasn't been implemented yet.")
+    }
+    print("h4eello")
+    encoded_sentence <- text %>%
+      tokenizer$tokenize() %>%
+      tokenizer$encode(., truncation = truncation, return_tensors = 'pt')
+    
+    embeddings = model(encoded_sentence)
+    
+    if (use_CLS){
+      to_return <- embeddings$last_hidden_state$squeeze()[0] # CLS token
+    } else{
+      stop("use_CLS is set to FALSE, but using layers is not implemented yet.")
+    }
+    # convert pytorch tensor to numpy array, which is then converted to a vector
+    to_return <- to_return$detach()$numpy() %>% as.vector()
+    #to_return <- as.vector(to_return)
+    
+    return(to_return) # vector of dim. 1x728
+  }
+  
+  trf_embedding(data[i, "description_cased"]
+                ,tokenizer=tokenizer 
+                ,model=model
+                ,truncation=TRUE
+                )
+  }
+}
+# my computer crashes when trying to benchmark this!
+# microbenchmark(thisfunction(df[1:3, ]), times=5)
+```
+

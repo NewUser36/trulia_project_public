@@ -1,0 +1,1251 @@
+---
+title: "Variable selection and performance"
+output:
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+header-includes:
+   - \usepackage{xcolor}
+   - \newcommand*{\red}[1]{\textcolor{red}{#1}}
+   - \newcommand*{\blue}[1]{\textcolor{blue}{#1}}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+# Setup
+
+```{r}
+# global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+# R packages
+library(tidyverse); library(magrittr); library(survival); library(survminer); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(riskRegression); library(pec); library(survAUC); library(glmnet); library(plotmo)
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+'%not in%' <- Negate('%in%')
+
+df_tfidf_99 <- read_feather("embeddings/tfidf_99.feather")
+df_ft <- read_feather("embeddings/fasttext.feather")
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+
+# Somes homes have been on sale for 7+ years, which I find highly unprobable
+df_bbu <- df_bbu %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+
+# PCA
+pca_bbu <- df_bbu %>%
+  select(V1:V728) %>%
+  PCA(., scale.unit = FALSE, graph = F, ncp=728) #TODO SHOULD BE 768 NOT 728
+
+# using 80% rule (will be used in coxph later)
+num_dimension <- length(as.data.frame(pca_bbu$eig)$'cumulative percentage of variance'[as.data.frame(pca_bbu$eig)$'cumulative percentage of variance' <= 80]) + 1 
+
+pca_bbu_coord <- data.frame(pca_bbu$ind$coord)
+colnames(pca_bbu_coord) <- paste0("bbu_dim.", 1:728) #TODO SHOULD BE 768 NOT 728
+df_bbu_pca <- cbind(df_bbu, pca_bbu_coord)
+
+df <- left_join(df_tfidf_99, df_ft) %>%
+  left_join(., df_bbu_pca)
+
+# REMARK : 
+# For the function extract_nonzero_coeff to work, variables treated as
+# factors must be transformed as factor here
+df <- df %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+     year_built = as.numeric(year_built)
+    ,num_bath = as.numeric(num_bath)
+    ,num_bed = as.numeric(num_bed)
+    ,living_area = as.numeric(living_area)
+    ,lot_area = as.numeric(lot_area)
+    ,listed_date = lubridate::date(listed_date)
+    ,sold_date = lubridate::date(sold_date)
+    ,I_heating = as.factor(I_heating)
+    ,I_cooling = as.factor(I_cooling)
+    ,I_parking = as.factor(I_parking)
+    ,I_outdoor = as.factor(I_outdoor)
+    ,I_pool = as.factor(I_pool)
+    ,I_type = as.factor(I_type)
+    ,event = as.numeric(event)
+  ) %>%
+  # need to have no spaces in categories for regex
+  mutate(
+    I_heating = recode(I_heating, "No Info" = "No_Info")
+    , I_cooling = recode(I_cooling, "No Info" = "No_Info")
+    , I_parking = recode(I_parking, "No Info" = "No_Info")
+    , I_outdoor = recode(I_outdoor, "No Info" = "No_Info") 
+    , I_pool = recode(I_pool, "No Info" = "No_Info")
+    , I_type = recode(I_type, "No Info" = "No_Info")
+  )
+```
+
+# Creating functions for performance measures
+```{r}
+r2_scaled <- function(model){
+  r2 <- 1 - exp(2/model$nevent*(model$loglik[1] - model$loglik[2]))
+  r2max <- 1 - exp(2/model$nevent*(model$loglik[1]))
+  
+  return(r2/r2max)
+}
+
+#TODO
+# NOT SURE IF WORKING!!!!
+# is it ok to use "times" if we have left-truncated data?????
+
+performance_measures <- function(model, olddata, newdata, times){
+  lp <- predict(model)
+  lpnew <- predict(model, newdata=newdata)
+  
+  pattern <- "Surv\\((.*?)\\) ~"
+  model_call <- as.character(model$call)
+  call = str_extract(model_call, pattern)[2] %>%
+    substr(., start=1, stop=nchar(.)-2) # to remove " ~"
+
+  # needs to be parsed before putting it in with(oldata, formula)
+  Surv_formula <- parse(text=call)
+  
+  Surv.rsp <- with(olddata, eval(Surv_formula))
+  Surv.rsp.new <- with(newdata, eval(Surv_formula))
+  # times <- 1:nrow(test)
+  times <- times
+  
+  brier <- survAUC::predErr(Surv.rsp, Surv.rsp.new, lp, lpnew, times, 
+        type = "brier", int.type = "unweighted") # does not seem to work
+
+  # survAUC::UnoC (might be working?)
+  # values can be in (0.5, 1)
+  Cstat <- survAUC::UnoC(Surv.rsp, Surv.rsp.new, lpnew)
+  
+  return(list(brier_score=brier
+              ,C_uno = Cstat
+              )
+         )
+}
+```
+
+# Functions used to compute performance
+```{r}
+train_valid_test <- function(df, id_column, p_train, p_valid, p_test=1-p_train-p_valid, type="stratified", random_seed=1){
+  #' Splits data in three parts (train, validation, test)
+  #'
+  #' @param df data.frame. The dataset 
+  #' @param id_column string. Variable on which we wish to split
+  #' @param p_train numeric. proportion of ids in training set, or approximative proportion of data for training
+  #' @param p_valid numeric. See p_train
+  #' @param type str. Façon dont les données sont séparées. "stratified" (default), "grouped" pour clustered or panel data
+  #' @param random_seed int. Seed used to randomly split data. Default is 1.
+  #'
+  #' @return \item{train}{data.frame. training set} \item{valid}{data.frame. validation set} \item{test}{data.frame. testing set}
+  
+  if(p_train + p_valid + p_test != 1){
+    stop("sum of probabilities must be 1")
+  }
+  
+  ids_split <- splitTools::partition(
+    y = dplyr::pull(df[, id_column]) # pull nécessaire car pbc est un tibble
+    # y = df[, id_column]
+    ,p = c(train = p_train, valid = p_valid, test = p_test)
+    ,type = type
+    ,seed = random_seed
+  )
+  
+  train <- df[ids_split$train, ]
+  valid <- df[ids_split$valid, ]
+  test <- df[ids_split$test, ]
+  
+  return(list(train=list(df=train, prop=nrow(train)/nrow(df)),
+              valid=list(df=valid, prop=nrow(valid)/nrow(df)),
+              test=list(df=test, prop=nrow(test)/nrow(df))
+              )
+         )
+}
+
+split <- train_valid_test(df, "event", p_train = 0.8, p_valid = 0.1)
+train <- split$train$df
+valid <- split$valid$df
+test <- split$test$df
+
+# After some thoughts, I don't think I will use a test set, so I will
+# merge valid and test to make a bigger validation set set
+test <- rbind(valid, test)
+rm(valid)
+
+
+outersect <- function(a,b){
+  #' Inverse of intersect(). Returns what is not common between two sets a and b.
+  unique(c(setdiff(a,b), setdiff(b,a)))
+} 
+
+extract_categories <- function(variable, df){
+  categories <- df[, variable] %>% unique()
+  categories
+}
+
+extract_var_categories <- function(df, variables_names){
+  if (is_tibble(df)){
+    df <- as.data.frame(df)
+  }
+  
+  # extract variables that are factors or characters
+  factors <- c()
+  for (variable in variables_names){
+    if (df[, variable] %>% class() %in% c("character", "factor"))
+      factors <- c(factors, variable)
+  }
+
+  # extract categories of character/factor variables
+  liste <- sapply(factors, extract_categories, df, USE.NAMES=TRUE)
+  liste
+}
+
+merge_factors <- function(factor, factors_to_merge, merge_to){
+  #' Levels in `factors_to_merge` will become `merge_to`.
+  #' 
+  #' @param factor factor. Factor to modify
+  #' @param factors_to_merge vector of string. Levels in factor to be merged with `merge_to`
+  #' @param merge_to str.
+  #' 
+  #' @return factor. Factor with modified levels
+  pattern <- paste(factors_to_merge, collapse="|")
+  
+  new_levels <- str_replace_all(levels(factor), 
+                               pattern=pattern, 
+                               replacement=merge_to
+                               )
+
+  levels(factor) <- new_levels
+  return(factor)
+}
+extract_var_categories(df, variables_names=c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries"))
+
+extract_zero_nonzero_coeff <- function(cvglmnet, lambda_value){
+  tmp_coeffs <- coef(cvglmnet, s = lambda_value)
+  non_zero_position <- tmp_coeffs@i
+
+                # count starts at 0   #-1 : count starts at 0 but length starts at 1                               
+  zeros_position <- seq(0, length(tmp_coeffs)-1) %>% outersect(., non_zero_position) + 1 # +1 because count starts at 0 but R starts listing at 1
+  zeros_variables <- tmp_coeffs@Dimnames[[1]][zeros_position]
+  ## zeros_variables : I_heatingNo, I_heatingYes, I_heating_No_Info, etc.
+  ## depending on what the model selected
+  
+  non_zeros_variables <- tmp_coeffs@Dimnames[[1]][tmp_coeffs@i+1] # +1 because count starts at 0
+  
+  return(list(zeros = zeros_variables,
+              non_zeros = non_zeros_variables))
+}
+
+performance_newcox_glmnet <- function(cvglmnet, 
+                                      lambda_value="lambda.1se", 
+                                      variables_names, 
+                                      embedding_names="", 
+                                      dataset,
+                                      surv_call
+                                      ){
+  #' Generate a new cox model based on the important variable determined by a cv.glmnet object. Factor levels that are deleted by the algorithm are merged to the reference level.
+  #'
+  #' @param cvglmnet cv.glmnet object
+  #' @param lambda_value numeric. default="lambda.1se". Value of lambda to use in coef(cv.glmnet, s=lambda)
+  #' @param variable_names str. Vector of strings with all the variables used in the Cox model, except the variables refering to the embeddings.
+  #' @param embedding_names str (optional). Variables refering to the text embeddings.
+  #' @param dataset data.frame or tibble. Train test used to train the model used in cv.glmnet
+  #' @param surv_call str. Survival formula of the cox model in string format. e.g. "Surv(time1, time2, event)"
+  #'
+  #' @return cox, tmp_dataset. `cox`: cox model evaluated on tmp_dataset. `tmp_dataset`: new dataset made from the original dataset, but with factor variable merged with reference value when they were not selected by the algorithm.
+  
+  # some dataset manipulation can't work if dataset is a tibble, so I convert it
+  # here. I will later transform this temporary df to merge factors if necessary 
+  tmp_dataset <- as.data.frame(dataset)
+  
+  ########################################################
+  # Create new dataset without factors removed by glmnet #
+  ########################################################
+  
+  zeros_non_zeros_variables <- extract_zero_nonzero_coeff(cvglmnet, lambda_value)
+  
+  # extract variable names with coefficient different from 0 in glmnet
+  zeros_variables <- zeros_non_zeros_variables$zeros
+  ## e.g. : I_heatingNo, I_heatingYes, I_heating_No_Info, etc.
+  ## depending on what the model selected
+
+  # extract categories of factor/character variables
+  list_factors <- extract_var_categories(tmp_dataset, variables_names)
+  factor_variables <- names(list_factors)
+  ## factor_variables = I_heating, I_parking, I_pool, I_outdoor
+
+  for (factor_variable in factor_variables){
+    pattern = paste0("(", factor_variable, ")", "([[:alpha:]]+[_]?[[:alpha:]]+)")
+
+    # extract VariableFactor from the list of variable with zero coefficient (zeros_variables)
+    zeros_variableFactor <- regmatches(zeros_variables, regexpr(pattern, zeros_variables))
+    ## e.g. c("I_heatingNo", "I_heatingYes")
+    
+    # zeros_variableFactor could be empty if no level is removed from the factor
+    # so we have to condition before trying to merge levels
+    if (!identical(character(0), zeros_variableFactor)){
+      
+      # extract factor from the VariableFactor vector
+      factors_to_merge_with_reference <- gsub(x=zeros_variableFactor
+                                              ,pattern=factor_variable
+                                              ,replacement=""
+                                              )
+      ## e.g. c("No", "Yes")
+  
+      # merge levels deleted by the algorithm in the reference level
+      #TODO do this for train and test (add parameter dataset_test)
+      reference <- levels(tmp_dataset[, factor_variable])[1] # first level is always the reference
+  
+      tmp_dataset[, factor_variable] <- merge_factors(tmp_dataset[, factor_variable]
+                                                  ,factors_to_merge=factors_to_merge_with_reference
+                                                  ,merge_to=reference
+                                                  )
+    }
+    
+    # if there is only one level in factor, the variable contains no information 
+    # anymore and should be removed from coxph formula to make sure there is no
+    # error with coxph.
+    to_remove <- c()
+    if (tmp_dataset[, factor_variable] %>% levels() %>% unique() %>% length() ==1){
+      to_remove <- c(to_remove, factor_variable)
+    }
+  }
+  
+  ######################################################
+  # create new cox model with variables kept by glmnet #
+  ######################################################
+  
+  ## extract non-zero variables from glmnet
+  non_zero_variablesFactor <- zeros_non_zeros_variables$non_zeros
+  ## e.g. num_bed, I_heatingNo, I_heatingYes, listed_price,...
+  
+  ## extract names of the variables without the added factor
+  pattern1 = paste0(embedding_names, collapse = "$|") %>% # exact match on embedding dimensions
+    paste0(., "$|")
+  pattern2 = paste0(variables_names, collapse="|", sep="") # partial match on variable names (to exclude the factor : I_heatingNo becomes I_heating)
+  pattern_12 = paste0(pattern1, pattern2)
+  
+  non_zero_variables <- stringr::str_extract(string=non_zero_variablesFactor, pattern=pattern_12) %>%
+    unique()
+  
+  # remove factors with only one level
+  #TODO HAVEN'T TESTED THIS, SO MIGHT CAUSE AN ERROR
+  non_zero_variables <- gsub(non_zero_variables, 
+                             pattern=paste(to_remove, collapse="|"), 
+                             replacement=""
+                             )
+  
+  new_cox_formula <- paste0(surv_call, "~", paste0(non_zero_variables, collapse="+")) %>%
+    as.formula()
+
+  # running cox model with new dataset and selected variables
+  cox_with_new_dataset <- coxph(
+  new_cox_formula
+  ,data=tmp_dataset
+  )
+  
+  ################################
+  # performance of new cox model #
+  ################################
+  #TODO
+  #create a function for this that does cross validation
+  
+  return(list(cox = cox_with_new_dataset
+              ,train_df = tmp_dataset
+              #,test_df=tmp_dataset_test
+              )
+         )
+}
+# variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+# embedding_names <- paste("ft", 1:300, collapse="+", sep="")
+# 
+# tmp <- performance_newcox_glmnet(cvtry1.1
+#                        ,lambda_value="lambda.1se"
+#                        ,variables_names=variables_names
+#                        ,dataset=train
+#                        ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+#                        )
+# tmp$cox
+```
+
+# Full model
+
+```{r}
+# without I_cooling (perfect multicolinearity), num_nightlife (col. with 
+# restaurants and groceries) and I_type (complete separation)
+full <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full)
+
+# Measures on train set : 
+# R2
+r2_scaled(full)
+summary(full)$rsq[1]/summary(full)$rsq[2] # should be the same thing
+# since this r2 is based on Nagelkirke (https://rdrr.io/cran/survival/man/summary.coxph.html)
+# which is the r2 we have seen in EPM-7028...
+
+# Concordance
+full$concordance["concordance"]
+full$concordance["std"]
+
+# AIC
+AIC(full)
+BIC(full)
+
+# Measures on test set (not sure if they all work) : 
+# Brier score (prediction error)
+# not sure what values of 'times' to choose
+scores <- performance_measures(model=full, olddata=train, newdata=test, times=18500:18870)
+#scores$brier_score$error
+
+# Uno's C (similar to C index with different weights?)
+scores$C_uno
+```
+
+# Regularization
+## glmnet
+
+```{r}
+try0 <- glmnet(x=full$x, y=full$y, family="cox"
+               ,alpha=0.95
+               ,trace.it = FALSE
+               )
+try0
+plot_glmnet(try0)
+```
+
+Since the default values of lambda are not covering a large enough range for my liking (glmnet uses certain rules to determine which values of lambda to use, which seem to stop at high values of lambda with this dataset), I will give glmnet a list of lambdas to cover. This list will be all numbers from 0.95 to 0 decreasing in step of 0.05. I will also add a bunch of smaller lambdas taken from glmnet. \red{This generates more convergence warnings (maybe simply because more values of lambda are tested?)...} :
+
+lambda.min.ratio : Smallest value for lambda, as a fraction of lambda.max, the (data derived) entry value (i.e. the smallest value for which all coefficients are zero). The default depends on the sample size nobs relative to the number of variables nvars. If nobs > nvars, the default is 0.0001, close to zero.
+
+The problem with modifying lambda.min.ratio is that the number of lambda tested remains relatively small, which means the path in cv.glmnet is relatively "sparse" (see plots for cv.glmnet below).
+
+# About lambda.min.ratio
+
+A parameter used in glmnet controls the amount of lambda tested, therefore the number of models tested in cross-validation. I recommend not changing this parameter, except if 1) glmnet clearly does not explore enough values of lambda (when models with only 0, 1 or 2 variables are tested) or 2) if it takes too long to compute cross-validation without specifying lambda.min.ratio. Values I used before were 0.1e-50 and 0.1e-25. A greater value means more lambdas are tested, so computation will take more time. 
+
+```{r}
+try0.1 <- glmnet(x=full$x, y=full$y, family="cox"
+               ,alpha=0.95
+               ,trace.it = FALSE
+               ,lambda.min.ratio = 0.1e-50
+               ) # 11 convergence warnings
+# more values are covered, especially some closer to 0
+try0.1
+plot_glmnet(try0.1)
+
+lambdas <- seq(0.95, 0, by=-0.05) %>%
+  c(., 0.082133530,0.050396373,0.030922747,0.018973911,0.011642216,0.007143556,0.004383219) %>%
+  sort(., decreasing=FALSE) %>%
+  .[. %not in% c(0)] # remove 0
+
+try0.2 <- glmnet(x=full$x, y=full$y, family="cox"
+               ,alpha=0.95
+               ,trace.it = FALSE
+               ,lambda = lambdas
+               ) # 26 convergence warnings
+try0.2
+plot_glmnet(try0.2)
+```
+
+```{r}
+# elastic-net
+glmnet.control(factory=TRUE)
+try1 <- glmnet(x=full$x, y=full$y, family="cox"
+               ,alpha=0.95
+               ,trace.it = FALSE
+               ,lambda=lambdas
+               ) # 25 warnings
+# there are also 25 warnings with mxitnr=50
+
+glmnet.control(mxitnr=50) # default : 25
+try2 <- glmnet(x=full$x, y=full$y, family="cox"
+               ,alpha = 0.95
+               ,trace.it = FALSE
+               ,lambda = lambdas
+               ) # 15 warnings with mxitnr=1000, and %Dev is negative in some 
+# places whereas it is positive with mxitnr=25
+
+plot_glmnet(try2, xvar = "lambda")
+try1
+try2
+# different %Dev...
+
+difference_coef <- function(lambda, modele_1, modele_2){
+  # Calcule la différence en pourcentage entre les coefficients de deux modèles
+  # modele_2 est le "vrai" modele, ie celui qui a le moins ou pas de non convergence
+  
+  (coef(modele_1, s=lambda) - coef(modele_2, s=lambda))/coef(modele_2, s=lambda)*100
+}
+difference_coef(try1$lambda, try1, try2)
+# There are significant differences between the two models!
+# I think it comes from the small values of the coefficients
+
+# ridge
+glmnet.control(factory=TRUE)
+try3 <- glmnet(x=full$x, y=full$y, family="cox", alpha=0
+               ,trace.it = FALSE
+               ,lambda=lambdas)
+try3
+plot_glmnet(try3, xvar="lambda")
+# more coefficients (obviously) but takes more time to run
+
+glmnet.control(mxitnr=50) # default : 25
+try4 <- glmnet(x=full$x, y=full$y, family="cox", alpha=0
+               ,trace.it = FALSE
+               ,lambda=lambdas)
+try4
+plot_glmnet(try4, xvar = "lambda")
+
+difference_coef(try1$lambda, try3, try4)
+```
+
+## cv.glmnet
+
+```{r}
+# eslastic-net, alpha=0.95
+glmnet.control(mxitnr=50)
+cvtry1 <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="C"
+                    , alpha=0.95
+                    , trace.it = FALSE
+                    , lambda=lambdas)
+plot(cvtry1)
+coef(cvtry1, s = "lambda.1se")
+# Models with small values of lambda perform very poorly, I do not know why
+# the rules used by glmnet do not try with smaller values of lambda.
+# I will put more small values of lambda in the df.
+# REMARK : in the glmnet paper, it is said that smaller values of lambda
+# are "poorly behaved" and "more computationnaly intensive", which could explain
+# why smaller values of lambda are not tested by default. Nevertheless, I still
+# feel like it should be done with this dataset...
+
+# The problem with modifying lambda.min.ratio is that the number of lambda 
+# tested remains relatively small (which leads to faster computation times)
+# which means the path in cv.glmnet is relatively "sparse"
+# smaller values of lambda.min.ratio leads to more lambdas tested in my testing
+cvtry1.1 <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="C"
+                    , alpha=0.95
+                    , trace.it = FALSE
+                    , lambda.min.ratio = 0.1e-50)
+plot(cvtry1.1)
+coef(cvtry1.1, s = "lambda.1se")
+
+# the problem with choosing my lambdas by hand is 1) it takes time to choose
+# them and 2) it takes time to evaluate the models.
+more_lambdas <- c(lambdas, seq(0.005, 0.1, by=0.005)) %>% sort()
+cvtry1.2 <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="C"
+                    , alpha=0.95
+                    , trace.it = FALSE
+                    , lambda=more_lambdas)
+plot(cvtry1.2)
+# Contrary to the two precedent method, 10 variables are chosen instead
+# of 7.
+
+# For the sake of simplicity, I will set lambda.min.ratio to a very small value
+# and hope for the best. I will keep a look at the values of lambda used
+# with this parameter.
+
+# best model according to likelihood
+cvtry2 <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="default"
+                    , alpha=0.95
+                    , trace.it = FALSE
+                    ,lambda.min.ratio = 0.1e-50)
+plot(cvtry2)
+coef(cvtry2, s = "lambda.min")
+
+# ridge is not useful in this scenario since it doesn't help very much with
+# variable selection compared to LASSO, so I won't do a "strict" ridge 
+# penalization, but I will use alpha=
+
+# elastic-net, alpha=0.5
+cvtry3 <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="C"
+                    , alpha=0.5
+                    , trace.it = FALSE
+                    ,lambda.min.ratio = 0.1e-50
+                    )
+plot(cvtry3)
+coef(cvtry3, s = "lambda.min")
+# alpha=0.5 gives similar results to alpha=0.95 (with type.measure="C")
+# (see cvtry1.1)
+# 7 variables recommended instead of 8. I will stick to alpha=0.95 
+# because I prefer to have regularization closer to LASSO than ridge.
+```
+
+
+# bert-base-uncased
+
+```{r}
+Formula <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("V", 1:728, collapse="+", sep=""))) #TODO SHOULD BE 768 NOT 728
+
+# full_bbu <- coxph(
+#   Formula
+#   , data=train
+#   , x=TRUE # for glmnet
+#   , model=TRUE # for glmnet
+# )
+# Error: C stack usage  7972180 is too close to the limit
+
+# I had the same error last summer when trying to adjust a model with too many
+# variables. On windows, I had convergence warnings, and on Linux, it can't
+# run.
+```
+
+
+# bert-base-uncased and PCA
+
+```{r}
+Formula <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("bbu_dim.", 1:num_dimension, collapse="+", sep="")))
+# remark : doesn't work with 728
+
+# num_dimension is the number of principal components necessary to explain
+# 80% of the variability in the embeddings.
+
+full_pca_bbu <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full_pca_bbu)
+
+# variable selection
+cv_pca_bbu_Cindex <- cv.glmnet(x=full_pca_bbu$x, y=full_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_bbu_Cindex)
+coef(cv_pca_bbu_Cindex, s="lambda.1se")
+```
+
+\red{Not a lot of lambdas are tested!!! Should I just trust glmnet's implementation that they are testing an appropriate number of lambdas?}
+
+```{r}
+cv_pca_bbu2 <- cv.glmnet(x=full_pca_bbu$x, y=full_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda=more_lambdas
+               )
+plot(cv_pca_bbu2)
+#coef(cv_pca_bbu2, s="lambda.1se")
+```
+
+Not much better in my opinion. Also it makes it more complicated to choose appropriate (according to what rule?) values of lambda for every model.
+
+```{r}
+embedding_names <- paste("bbu_dim.", 1:num_dimension, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+
+cox_pca_bbu_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_pca_bbu_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+cox_pca_bbu_regularized_Cindex$cox %>% summary()
+
+# with loglik
+cv_pca_bbu_loglik <- cv.glmnet(x=full_pca_bbu$x, y=full_pca_bbu$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_bbu_loglik)
+coef(cv_pca_bbu_loglik, s="lambda.1se")
+
+cox_pca_bbu_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_pca_bbu_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+```
+
+# fasttext
+
+Since fasttext's embeddings have already been passed through a PCA, I won't need to to that again before putting it in the Cox model.
+
+```{r}
+Formula <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("ft", 1:300, collapse="+", sep="")))
+
+full_ft <- coxph(
+  Formula
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full_ft)[14]
+
+cv_pca_ft_Cindex <- cv.glmnet(x=full_ft$x, y=full_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_ft_Cindex)
+cv_pca_ft_Cindex$cvm
+
+embedding_names <- paste("ft", 1:300, collapse=",", sep="") %>%
+  strsplit(., ",") %>%
+  extract2(1) # extract first element of the list generated by strsplit
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+
+cox_ft_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_pca_ft_Cindex 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+
+cv_pca_ft_loglik <- cv.glmnet(x=full_ft$x, y=full_ft$y, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-50
+               )
+plot(cv_pca_ft_loglik)
+cv_pca_ft_loglik$cvm
+
+cox_ft_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_pca_ft_loglik 
+                      ,variables_names=variables_names
+                      ,embedding_names=embedding_names
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+
+cox_ft_regularized_Cindex$cox
+cox_ft_regularized_loglik$cox
+```
+
+The "best model" is has a very different number of variables depending on the criteria used, unfortunately.
+
+# Comparison of models : transformers vs fasttext
+```{r}
+index <- cv_pca_bbu_Cindex$index
+#[2] to extract cvm of lambda.1se
+cv_pca_bbu_Cindex$cvm[index][2]
+cv_pca_bbu_Cindex$cvsd[index][2]
+
+index <- cv_pca_ft_Cindex$index
+cv_pca_ft_Cindex$cvm[index][2]
+cv_pca_ft_Cindex$cvsd[index][2]
+```
+
+# tf-idf
+
+```{r}
+#TODO : choose words with IDF term
+
+# TODO make this less hardcoded...
+words <- colnames(df_tfidf_99)[26:length(colnames(df_tfidf_99))]
+
+Formula <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words, collapse="+", sep="")))
+
+# as shown in the appendix, I can extract the design matrix that needs to be 
+# given to glmnet using a linear model. I do this because there are too many
+# variables to adjust the model for coxph
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words, collapse="+", sep="")))
+
+linear <- lm(formula_lr, data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(as.numeric(listed_date), as.numeric(sold_date), event))
+
+cox_tfidf99 <- glmnet(x=design_matrix, y=yss, family="cox"
+                      , alpha=0.95
+                      , trace.it = FALSE
+                      , lambda.min.ratio = 0.1e-50
+                      )
+plot_glmnet(cox_tfidf99)
+
+
+cv_tfidf99_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-25 # increased because of divergence
+               )
+plot(cv_tfidf99_Cindex)
+coef(cv_tfidf99_Cindex, s="lambda.1se")
+
+tmp_coeffs <- coef(cv_tfidf99_Cindex, s="lambda.1se")
+df_coefs = data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], coefficient = tmp_coeffs@x)
+
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+cox_tfidf99_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+#TODO : convergence issues because there are too many variables
+summary(cox_tfidf99_regularized_Cindex$cox)
+
+cv_tfidf99_loglik <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-25 # increased because of divergence
+               )
+
+cox_tfidf99_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+
+
+#TODO : reduce dimension with IDF or PCA or something else?
+var_imp <- df_coefs2$name
+
+
+# I will try to adjust another model without the words trulia and oneofakind
+# because they have upper 0.95 = Inf in cox_tfidf99_regularized_Cindex$cox
+# VERY LONG TO RUN so I use nfolds=3 in cvglmet
+
+words_without_trulia_oneofakind <- words[str_detect(words, pattern="trulia|oneofakind", negate=TRUE)]
+
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words_without_trulia_oneofakind, collapse="+", sep="")))
+
+linear <- lm(formula_lr, data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(as.numeric(listed_date), as.numeric(sold_date), event))
+
+cv_tfidf99_Cindex_notruliaoneofakind <- cv.glmnet(
+  x=design_matrix, y=yss, family="cox"
+               , nfolds = 3
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-25 # increased because of divergence
+  )
+
+cox_tfidf99_regularized_cindex_notruliaoneofakind <- performance_newcox_glmnet(
+  cvglmnet = cv_tfidf99_Cindex_notruliaoneofakind
+  ,variables_names=variables_names
+  ,embedding_names=words_without_trulia_oneofakind
+  ,dataset=train
+  ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+)
+cox_tfidf99_regularized_cindex_notruliaoneofakind$cox
+
+
+
+# create tfidf models, but instead of using all of the 1095 words, we will use 
+# words in a smaller subset
+source("generate_embeddings.R")
+
+my_stopwords <- c(tm::stopwords())
+atest2 <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 1
+                      , low_document_frequency = 75
+                      , lower_IDF_quantile = 0.01
+                      )
+atest2$tfidf %>% as.matrix() %>% dim()
+# instead of using 1095 words, we use 810
+lesswords <- atest2$tfidf %>% colnames()
+
+# remove words that start with numbers (can't use in lm)
+lesswords_nonum <- lesswords[!str_detect(lesswords, pattern = "^[[:digit:]]{1,}[[:alpha:]]{1,}|faã§ad")]
+
+to_use <- intersect(words, lesswords_nonum) %>%
+  subset(subset=!str_detect(., pattern="trulia"))
+# remove 'trulia' because of convergence issues with coxph that is not present
+# with glmnet. I don't know why there is a convergence problem...
+atest2$tfidf[,"trulia"] %>% table()
+
+# technically, words used in 99% of texts (words) and 
+# words used in 99% of text and that have IDF > 0.01th quantile (lesswords)
+# should equal to the second vector (lesswords), which is not the case here
+# I don't know why
+#TODO : error?
+# using the intersect between words and less_words_nonum garanties that 
+# as.formula will work and forces less words in the model, maybe
+# there will be better results
+
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(to_use,collapse="+")))
+
+linear <- lm(formula_lr, data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(as.numeric(listed_date), as.numeric(sold_date), event))
+
+cv_tfidf99_IDF1_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               , lambda.min.ratio = 0.1e-25 # increased because of divergence
+               )
+cox_tfidf99_IDF1_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_IDF1_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=to_use
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+cox_tfidf99_IDF1_regularized_Cindex$cox %>% summary()
+```
+
+
+
+# tf-idf
+```{r}
+source("generate_embeddings.R")
+
+my_stopwords <- c(tm::stopwords())
+a <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 1
+                      )$dtm
+
+a2 <- as.matrix(a) %>% as.data.frame() # can be a matrix or dataframe before 
+# converting to DocumentTermMatrix
+
+idf_a <- extract_idf(a)
+ghist_idf(idf_a, bins=10)
+
+quantile(idf_a, details=T, prob=c(0, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.06, 0.10))
+
+words_overused <- idf_a %>% 
+  subset(subset=idf_a < quantile(idf_a, prob=c(0.01))) %>%
+  sort()
+length(words_overused)
+words_overused
+
+words_overused %>% 
+  names() %>%
+  intersect(., var_imp)
+# some words that would be deleted with IDF < quantile(0.01) are considered 
+# important by glmnet (that being said, there is a lot of variability to 
+# glmnet's selected variables). For what it's worth, a lot of those variables 
+# are considered significative by the Cox model.
+
+# What would the dimensionnality of the model be if I applied the following rules :
+# remove words if IDF < quantile(0.01)
+# remove words if document frequency of the word is <= 3
+atest <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 1
+                      , low_document_frequency = 75
+                      )
+atest$tfidf %>% as.matrix() %>% dim()
+# which makes sense because removing words that are not in 1% of documents 
+# via the parameter SparseTermsPercent=0.99 
+# (low_document_frequency = 1/100*7532=75.32) gives 1095 words
+nrow(words)
+# Therefore, in the algorithm, they compute tf-idf after removing low_frequency
+# words, as I'm doing right now.
+
+atest2 <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 1
+                      , low_document_frequency = 75
+                      , lower_IDF_quantile = 0.01
+                      )
+atest2$tfidf %>% as.matrix() %>% dim()
+
+intersect(words, (atest2$tfidf %>% colnames)) %>% length()
+# technically, words used in 99% of texts (words) and 
+# words used in 99% of text and that have IDF > 0.01th quantile (lesswords)
+# should equal to the second vector (lesswords), which is not the case here
+# I don't know why
+#TODO : error?
+
+
+# What does the histogram of IDF looks like if we remove words that are only
+# present in one percent of document?
+b <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 0.99
+)$dtm
+
+b2 <- as.matrix(b)
+dim(b2)
+
+idf_b <- extract_idf(b)
+ghist_idf(idf_b, bins=10)
+```
+
+
+
+# Comparison of models
+
+```{r}
+# model without texts
+notext_Cindex <- cv.glmnet(full$x, full$y, family = "cox"
+                    , nfolds = 5
+                    , type.measure="C"
+                    , alpha=0.95
+                    , trace.it = FALSE
+                    , lambda.min.ratio = 0.1e-50
+                    )
+
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+notext_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = notext_Cindex
+                      ,variables_names=variables_names
+                      ,dataset=train
+                      ,surv_call="Surv(as.numeric(listed_date), as.numeric(sold_date), event)"
+                      )
+
+# cv_pca_bbu_Cindex -> cox_pca_bbu_regularized
+# cv_pca_bbu_loglik -> cox_pca_bbu_regularized_loglik
+# 
+# cv_pca_ft_Cindex -> cox_ft_regularized_Cindex
+# cv_pca_ft_loglik -> cox_ft_regularized_loglik
+# 
+# cv_tfidf99_Cindex -> cox_tfidf99_regularized_Cindex
+
+# comparison of cross-validation Cindex (calculated with glmnet, therefore with regularization)
+
+df_crossval_concordance <- function(RowNames, models){
+  Cvm <- c()
+  Cvmsd <- c()
+  
+  for (model in models){
+    
+    # extract model from environment from the text in models
+    model1 <- eval(parse(text=model))
+    
+    # [2] to extract value at "lambda.1se"
+    # cvm is concordance index for models with type.measure="C", or log-likelihood
+    # for models with type.measure="default
+    concordance = model1$cvm[model1$index][2] 
+    concordance_sd = model1$cvsd[model1$index][2]
+    
+    Cvm <- c(Cvm, concordance)
+    Cvmsd <- c(Cvmsd, concordance_sd)
+  }
+  
+  df <- data.frame(crossval_score=Cvm, sd = Cvmsd)
+  rownames(df) <- RowNames
+  
+  return(df)
+}
+RowNames = c(
+    "bert+pca+cindex"
+    ,"bert+pca+loglik"
+    ,"ft+cindex"
+    ,"ft+loglik"
+    ,"tfidf99+cindex"
+    ,"tfidf99+loglik"
+    ,"tfidf99+idf1+cindex"
+    ,"tfidf99_+notruliaoneofakind+Cindex"
+  )
+
+models_vect <- c(
+  "cv_pca_bbu_Cindex"
+  ,"cv_pca_bbu_loglik"
+  ,"cv_pca_ft_Cindex"
+  ,"cv_pca_ft_loglik"
+  ,"cv_tfidf99_Cindex"
+  ,"cv_tfidf99_loglik"
+  ,"cv_tfidf99_IDF1_Cindex"
+  ,"cv_tfidf99_Cindex_notruliaoneofakind"
+)
+df_crossval_concordance(RowNames, models_vect)
+
+# comparison of aic, bic and concordance (on train set)
+df_scores <- function(RowNames, models){
+  AICs <- c()
+  BICs <- c()
+  Cs <- c()
+  Csds <- c()
+  num_var <- c()
+  
+  for (model in models){
+    
+    # extract model from environment from the text in models
+    model1 <- eval(parse(text=model))
+    
+    aic <- AIC(model1)
+    bic <- BIC(model1)
+    C <- concordance(model1)$concordance
+    Csd <- concordance(model1)$var %>% sqrt()
+    vars <- coef(model1) %>% length()
+    
+    AICs <- c(AICs, aic)
+    BICs <- c(BICs, bic)
+    Cs <- c(Cs, C)
+    Csds <- c(Csds, Csd)
+    num_var <- c(num_var, vars)
+  }
+  
+  df <- data.frame(AIC=AICs, BIC=BICs, concordance=Cs, concordance_sd = Csds, num_vars=num_var)
+  rownames(df) <- RowNames
+  
+  return(df)
+}
+
+models_vect <- c(
+  "full"
+  ,"notext_regularized_Cindex$cox"
+  ,"cox_pca_bbu_regularized_Cindex$cox"
+  ,"cox_pca_bbu_regularized_loglik$cox"
+  ,"cox_ft_regularized_Cindex$cox"
+  ,"cox_ft_regularized_loglik$cox"
+  ,"cox_tfidf99_regularized_Cindex$cox" # no convergence
+  ,"cox_tfidf99_regularized_cindex_notruliaoneofakind$cox"
+  ,"cox_tfidf99_regularized_loglik$cox"
+  ,"cox_tfidf99_IDF1_regularized_Cindex$cox" # weird results
+)
+
+rownames <- c(
+    "notext"
+    ,"notext+regularization_cindex"
+    ,"bert+pca+cindex"
+    ,"bert+pca+loglik"
+    ,"ft+cindex"
+    ,"ft+loglik"
+    ,"tfidf99+cindex"
+    ,"tfidf99+notruliaoneofakind+Cindex"
+    ,"tfidf99+loglik"
+    ,"tfidf99+idf1+cindex"
+  )
+
+# remark : convergence problems with "tfidf99+cindex"
+df_scores(rownames, models_vect)
+
+# results between tfidf99+notruliaoneofakind+Cindex and tfidf99+cindex are
+# different, but tfidf99+cindex gives better result even though there
+# was a warning message saying "In agreg.fit(X, Y, istrat, offset, init,
+# control, weights = weights,  :  Loglik converged before variable  63,83 ; 
+# beta may be infinite." Therefore, it is probably ok to not bother
+# with this error message
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Appendix A: model.matrix()
+
+Sometimes, if there are too many variables, I cannot run a coxph model to get the design matrix of the data (cox_model\$x). But, we could use the function model.matrix() ourself to create the design matrix. Another (simpler) way is to do a linear regression, remove the (Intercept) column from the design matrix and use that one instead. The following code chunk shows that the design matrix made using a linear regression as described here is the same as the design matrix that would be produced by coxph.
+
+```{r}
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("ft", 1:300, collapse="+", sep="")))
+
+untest <- lm(formula_lr, data=train)
+
+formula_cox <- as.formula(paste("Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste("ft", 1:300, collapse="+", sep="")))
+
+deuxtest <- coxph(formula_cox
+      , data=train
+      , x=TRUE
+      , y=TRUE
+      )
+
+all(model.matrix(untest)[,-1] == model.matrix(deuxtest))
+
+# We can see the results from glmnet are the same :
+glmnet(x=deuxtest$x, y=deuxtest$y, family="cox")
+glmnet(x=model.matrix(untest)[,-1], y=deuxtest$y, family="cox")
+```
+
+# Appendix B: converting matrices and dataframes to DocumentTermMatrix
+```{r}
+# can I convert matrices/dataframes to DocumentTermMatrix?
+a3 <- as.DocumentTermMatrix(a2, weighting="weightTf")
+inspect(a3)
+inspect(a)
+
+idf_a3 <- extract_idf(a3)
+
+head(idf_a3, 10)
+head(idf_a, 10)
+
+tf_idf_a3 <- as.matrix(weightTfIdf(a3, normalize = FALSE))
+tf_idf_a <- tf_idf_embedding(df$description_cased
+                      , normalize_tfidf = FALSE
+                      , SparseTermsPercent = 1
+                      )$tfidf
+nrow(tf_idf_a)*ncol(tf_idf_a)
+(tf_idf_a == tf_idf_a3) %>% sum() 
+# every element is TRUE if sum is equal to nrow(tf_idf_a)*ncol(tf_idf_a)
+# Conclusion : yes, there is no loss of info
+```
+
+# Appendix C : computing AIC and BIC for cox models
+
+I just wanted to make sure that the formulas I saw on internet to compute AIC and BIC were the one used in R. 
+
+```{r}
+extractAIC(full)
+AIC(full)
+
+# coxmodel$info[1] is the degrees of freedom=number of betas
+-2*full$loglik[2] + 2*full$info[1] 
+
+BIC(full)
+-2*full$loglik[2] + log(full$nevent)*full$info[1]
+
+# BIC penalizes the addition of parameters in the model more than AIC
+# if log(number of events) > 2, so if number of events > 8.
+```
+

@@ -1,0 +1,93 @@
+---
+title: "length_bias"
+date: "02/11/2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+# R packages
+library(tidyverse); library(magrittr); library(survival); library(survminer); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(riskRegression); library(pec); library(survAUC); library(glmnet); library(plotmo)
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+'%not in%' <- Negate('%in%')
+
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+
+
+
+# Somes homes have been on sale for 7+ years, which I find highly unprobable
+df_bbu <- df_bbu %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+```
+
+# Comparison of sale\_time between censored end events
+
+After reflexion on the way data was collected, it is probably ok to assume length bias is not a problem with this dataset. Indeed, pas trop besoin de gérer le biais de longueur car j'ai toutes les maisons vendues sur un intervalle de deux mois depuis la collecte des données, peu importe le temps de vente de la maison. Les données censurées sont potentiellement plus courtes, mais ça fait partie du principe d'avoir des données censurées...
+
+```{r}
+# sale_time is in months
+ggplot(df_bbu, aes(sale_time, fill = as.factor(event))) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..)
+                  ,position = 'identity'
+                  ,bins = 50
+                  )
+
+ggplot(df_bbu, aes(log(sale_time), fill = as.factor(event))) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..)
+                  ,position = 'identity'
+                  ,bins = 50
+                  )
+
+# kolmogorov-smirnov
+ks.test(df_bbu[df_bbu$event==0,]$sale_time
+        ,df_bbu[df_bbu$event==1,]$sale_time
+        ,alternative = c("two.sided")
+        )
+ks.test(df_bbu[df_bbu$event==0,]$sale_time
+        ,df_bbu[df_bbu$event==1,]$sale_time
+        ,alternative = c("less")
+        )
+
+# kullback-leibler divergence :
+# not the same number of observation in each group
+#install.packages("FNN")
+library(FNN)
+set.seed(1000)
+X<- rexp(10000, rate=0.2)
+Y<- rexp(100, rate=0.4)
+
+KL.divergence(X, Y, k=5)
+#theoretical divergence = log(0.2/0.4)+(0.4-0.2)-1 = 1-log(2) = 0.307
+
+# compare percentiles
+#install.packages("WRS", repos="http://R-Forge.R-project.org")
+# https://www.r-bloggers.com/2012/04/comparing-all-quantiles-of-two-distributions-simultaneously/
+
+library(WRS)
+qcomhd(df_bbu[df_bbu$event==0,]$sale_time
+       ,df_bbu[df_bbu$event==1,]$sale_time
+       ,q = seq(.1, .9, by=.2))
+```
+

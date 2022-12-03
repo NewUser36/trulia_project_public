@@ -1,0 +1,636 @@
+---
+title: "corrupt_texts"
+output:
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+# R packages
+library(tidyverse); library(magrittr); library(survival); library(survminer); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(riskRegression); library(pec); library(survAUC); library(glmnet); library(plotmo); library(quanteda); library(R.utils)
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+# R.utils : to insert elements to a vector. If not available, try to use "append", but insert is more flexible
+
+# Python setup
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+
+spacyr::spacy_initialize(model="en_core_web_lg",
+                         condaenv="r_nlp2",
+                         refresh_settings = TRUE)
+
+# Other things
+'%not in%' <- Negate('%in%')
+
+sample_text <- c("Barack Obama was the 44th president of the United States. He was the first black president.", "Estate   sale and short sale subject to approval of third party bedroom   family   house with private driveway car garage , in prime area close to public transportation .Please    do not disturb occupants of the property .","Create own or bedroom dream home !   Apartment g , situated in the coveted excelsior ,   has spectacular views to the north , south and west . With approximately square feet of space , this home can be transformed into a stunning apartment . The excelsior is a white glove building located in the heart of midtown manhattan . Residents enjoy the service of a hour doorman , elevator attendant , concierge , a cleaning valet , and hour garage with circular driveway . Amenities are comprised of state - of - the - art gym and spa , indoor / outdoor sea salt water pool , sun bathing deck , sauna , and steam room . Pets , w / ds , and pied - a - terres and % financing allowed . Land lease building .")
+
+# import data
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+df <- df_bbu %>%
+  select(!V1:V768)
+# remove everything that is related to bert embeddings
+
+# Houses on sale for >20 months or that took more than 20 months to sell
+# are censored to 20 months
+df <- df %>%
+  mutate(
+    to_modify = case_when(sale_time > 20 ~ 1
+                          ,TRUE ~ 0 # else
+                          )
+    , event = case_when(to_modify == 1 ~ 0 # censoring events flagged as to_modify
+                       ,TRUE ~ event)
+    , sale_time = case_when(to_modify ==1 ~ 20 # sale_time forced to 20 months
+                            ,TRUE ~ sale_time)
+  )
+# before censoring events that took too long, there were 1567 events. After
+# censoring at 20 months, there where 1537 events (20% of the dataset).
+
+# REMARK : 
+# For the function extract_nonzero_coeff to work, variables treated as
+# factors must be transformed as factor here
+df <- df %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+     year_built = as.numeric(year_built)
+    ,num_bath = as.numeric(num_bath)
+    ,num_bed = as.numeric(num_bed)
+    ,living_area = as.numeric(living_area)
+    ,lot_area = as.numeric(lot_area)
+    ,listed_date = lubridate::date(listed_date)
+    ,sold_date = lubridate::date(sold_date)
+    ,I_heating = as.factor(I_heating)
+    ,I_cooling = as.factor(I_cooling)
+    ,I_parking = as.factor(I_parking)
+    ,I_outdoor = as.factor(I_outdoor)
+    ,I_pool = as.factor(I_pool)
+    ,I_type = as.factor(I_type)
+    ,event = as.numeric(event)
+  ) %>%
+  # need to have no spaces in categories for regex
+  mutate(
+    I_heating = recode(I_heating, "No Info" = "No_Info")
+    , I_cooling = recode(I_cooling, "No Info" = "No_Info")
+    , I_parking = recode(I_parking, "No Info" = "No_Info")
+    , I_outdoor = recode(I_outdoor, "No Info" = "No_Info") 
+    , I_pool = recode(I_pool, "No Info" = "No_Info")
+    , I_type = recode(I_type, "No Info" = "No_Info")
+  )
+```
+
+# spacy models
+
+- en_core_web_sm : smallest model. No word vectors so it will be faster to use if it is not necessary to have word vectors.
+- en_core_web_md : medium model.
+- en_core_web_lg : large model. 
+- en_core_web_trf : based on romberta. It is the best model, but it is significantly slower.
+
+Documentation : https://spacy.io/models
+
+By default, `spacyr` uses the `en_core_web_sm` to generate part of speech tagging. This model is as accurate for part of speech tagging as `en_core_web_md` and `en_core_web_lg`, almost as good for named entity recognition, but `en_core_web_trf` is better in every way. Since `en_core_web_sm` is a probably a lot faster than the model based on transformers, it might be better to use the smaller model. Using `en_core_web_trf` is not worth it in terms of speed in my opinion.
+
+# Functions to remove elements of the text
+
+I will use `spacyr` to generate part of speech tagging for the text. I will then use the tag to remove the word (for example, remove the word if it is not a noun and a verb). I use directly this package instead of working directly with spacy (with reticulate) because I wasn't able to create a for loop in `R` with a `spacy` object. 
+
+I will use the model `en_core_web_lg` because it is slightly better for NER than `en_core_web_sm` and the difference in speed is not significant in my testing.
+
+Interesting sources :
+- https://www.kaggle.com/prokopyev/spacy-features-for-text-classification-in-r
+- https://github.com/quanteda/spacyr
+
+```{r}
+# spacyr uses en_core_web_sm
+corrupt_texts <- function(texts, 
+                          pos_to_keep=NULL, 
+                          pos_to_remove=NULL, 
+                          remove_stopwords=FALSE,
+                          lowercase=TRUE
+                          ){
+  #' Corrupt the text by removing certain types of words (according to their part of speech tag and stopwords). Can be used to lowercase every character in the text.
+  #'
+  #' @param texts 
+  #' @param pos_to_keep vector. Vector of strings that should be kept in the text. e.g. c("PROPN", "NOUN", "DET"). Cannot be used at the same time as pos_to_remove.
+  #' @param pos_to_remove vector. Vector of strings that should be removed from the text. Cannot be used at the same time as pos_to_keep.
+  #'
+  #' @return Vector containing the corrupted text.
+  
+  if (!is.null(pos_to_keep) & !is.null(pos_to_remove)){
+    stop("`pos_to_keep` and `pos_to_remove` cannot be used at the same time.")
+  }
+  
+  if (lowercase){
+    texts <- tolower(texts)
+  }
+  
+  df_pos <- spacyr::spacy_parse(texts 
+                                ,tag = FALSE 
+                                ,lemma=FALSE 
+                                ,entity=FALSE
+                                ,additional_attributes=c("is_stop")
+                                )
+
+  # remove stop words from text if wanted
+  if (remove_stopwords){
+    df_pos <- df_pos %>%
+      filter(is_stop==FALSE)
+  }
+  
+  # keep words according to pos...
+  if (!is.null(pos_to_keep)){
+    filtered_text_df <- df_pos %>%
+    filter(pos %in% pos_to_keep) 
+  # ... or remove words according to pos
+  } else if (!is.null(pos_to_remove)){
+    filtered_text_df <- df_pos %>%
+    filter(pos %not in% pos_to_remove) 
+  } else{
+    filtered_text_df <- df_pos
+  }
+  
+  add_whitespace <- function(strings){
+    paste(strings, collapse=" ")
+  }
+  
+  final_texts <- sapply(as.tokens(filtered_text_df), FUN=add_whitespace) %>%
+    as.vector()
+  
+  # Detect documents that were lost in spacy_sparse because they became
+  # empty when removing words
+  documents_in_df_pos <- filtered_text_df$doc_id %>%
+    unique() %>%
+    str_extract_all(., pattern="[[:digit:]]{1,}")
+  vector_of_obs <- 1:length(texts)
+
+  outersect <- function(a,b){
+  #' Inverse of intersect(). Returns what is not common between two sets a and b.
+  unique(c(setdiff(a,b), setdiff(b,a)))
+  } 
+  empty_string_positions <- outersect(documents_in_df_pos, vector_of_obs) %>% unlist()
+
+  # if there are empty documents in the original texts after filtering...
+  if (!is.null(empty_string_positions)){
+    # ...re-add empty documents in the vector
+    final_texts <- R.utils::insert(final_texts, ats=empty_string_positions, values="")
+  }
+  
+  return(final_texts)
+}
+
+corrupt_texts(texts=c("This is a first sentence", "20827h-", "another one"), pos_to_remove = c("NUM", "PRON", "DET", "PROPN"))
+
+#corrupt_texts(texts=df$description_cased[1:1150], pos_to_remove = c("NUM", "PRON", "DET", "PROPN"))
+```
+
+```{r}
+sample_text <- c("Barack Obama was the 44th president of the United States. He was the first black president.", "", "something else.", "a", "b", "c", "d", "e", "f", "g", "", "h", "i", "j")
+
+df_pos <- spacyr::spacy_parse(sample_text, tag = FALSE, lemma=FALSE, entity=FALSE,
+                              additional_attributes=c("is_stop"))
+
+# entity=FALSE is faster
+df_pos %>% filter(is_stop==FALSE)
+
+documents_in_df_pos <- df_pos$doc_id %>% unique() %>% str_extract_all(., pattern="[[:digit:]]{1,}")
+vector_of_obs <- 1:length(sample_text)
+
+outersect <- function(a,b){
+  #' Inverse of intersect(). Returns what is not common between two sets a and b.
+  unique(c(setdiff(a,b), setdiff(b,a)))
+} 
+empty_string_positions <- outersect(documents_in_df_pos, vector_of_obs) %>% unlist()
+R.utils::insert(sample_text, ats=empty_string_positions, values="")
+
+df_pos %>% as.tokens()
+
+filtered_text <- df_pos %>%
+  filter(pos %in% c("PROPN", "NOUN", "DET"))
+
+a <- filtered_text %>% as.tokens()
+
+add_whitespace <- function(strings){
+  paste(strings, collapse=" ")
+}
+
+# there will be white space around punctuation
+# the sample data of the real dataset is also like this
+sapply(df_pos %>% as.tokens(), FUN=add_whitespace)
+```
+
+
+# Generate typos
+
+Adapted from [stackoverflow](https://stackoverflow.com/a/56909841) 
+
+```{r}
+is_upper <- function(character){
+  character==toupper(character)
+}
+
+# keyboard layout used : english US, qwerty
+nearbykeys = list(
+    'a' = c('q','w','s','z'),
+    'b' = c('v','g','h','n'),
+    'c' = c('x','d','f','v'),
+    'd' = c('s','e','r','f','c','x'),
+    'e' = c('w','s','d','r'),
+    'f' = c('d','r','t','g','v','c'),
+    'g' = c('f','t','y','h','b','v'),
+    'h' = c('g','y','u','j','n','b'),
+    'i' = c('u','j','k','o'),
+    'j' = c('h','u','i','k','n','m'),
+    'k' = c('j','i','o','l','m'),
+    'l' = c('k','o','p'),
+    'm' = c('n','j','k'),
+    'n' = c('b','h','j','m'),
+    'o' = c('i','k','l','p', '0'),
+    'p' = c('o','l'),
+    'q' = c('w','a','s'),
+    'r' = c('e','d','f','t'),
+    's' = c('w','e','d','x','z','a'),
+    't' = c('r','f','g','y'),
+    'u' = c('y','h','j','i'),
+    'v' = c('c','f','g','v','b'),
+    'w' = c('q','a','s','e'),
+    'x' = c('z','s','d','c'),
+    'y' = c('t','g','h','u'),
+    'z' = c('a','s','x'),
+    '?' = c('/','>', '.', "'"),
+    '.' = c(',', '/')
+)
+
+
+replace_character <- function(character){
+  # try-catch for characters that are not in nearbykeys, such as @, é, etc.
+  tryCatch({
+    typo_vector = nearbykeys[character][[1]] # e.g. for 'z', c('a','s','x')
+    new_character = sample(typo_vector, 1)
+    return(new_character)
+  },
+  error = function(w){
+    # if character doesn't exist in nearbykeys list, return the original character
+    return(character)
+  }
+  )
+}
+replace_character('z')
+
+add_character <- function(character){
+  # try-catch for characters that are not in nearbykeys, such as @, é, etc.
+  tryCatch({
+    typo_vector = nearbykeys[character][[1]] # e.g. for 'z', c('a','s','x')
+    new_character = sample(c(character, typo_vector), 1)
+    return(paste(c(character, new_character), collapse=""))
+  },
+  error = function(w){
+    # if character doesn't exist in nearbykeys list, return the original character
+    return(character)
+  }
+  )
+}
+add_character("a")
+
+remove_character <- function(character){
+  return("")
+}
+
+inverse_character <- function(character1, character2){
+  return(c(character2, character1))
+}
+inverse_character('a','b')
+
+is_alpha <- function(character){
+  #' Check if character is a alphabetic.
+  grepl("[[:alpha:]]", character)
+}
+
+generate_typos <- function(text, 
+                           typo_prob=0.01,
+                           first_last_character_prob_factor=0.5,
+                           replace_prob=0.25,
+                           add_prob=0.25,
+                           remove_prob=0.25,
+                           inverse_prob=0.25){
+  #' Generate typos in a text. The text should have more than one character to prevent unexpected behavior.
+  #'
+  #' @param text str. A text.
+  #' @param typo_prob numeric. Probability of making a mistake in the text.
+  #' @param first_last_character_prob_factor numeric. If there is a smaller chance of making a typo when writing the first and last digit, by what factor should the probability be reduced?
+  #' @param replace_prob numeric. Probability of replacing the character by one close to it.
+  #' @param add_prob numeric. Probability of adding a character close to the current one.
+  #' @param remove_prob numeric. Probability of removing current character.
+  #' @param inverse_prob numeric. Probability of inversing current character with next one.
+  #'
+  #' @details The inversion of two characters is with character i and i+1. Therefore, it is not possible to invert the last character. In this case, the last character is inverted with the previous one.
+  #'
+  #' @return text. Modified text.
+
+  if (replace_prob+add_prob+remove_prob+inverse_prob!=1){
+    stop("Sum of probabilities must be one to get expected behavior.")
+  }
+  
+  textsplit <- strsplit(text, "")[[1]]
+  capitalization = rep(FALSE,length(textsplit))
+  
+  position <- 1
+  i <- 1
+  while (i <= length(textsplit)){
+    
+    # make all characters lowercase and record uppercase
+    if (is_upper(textsplit[i]) & is_alpha(textsplit[i])){
+      capitalization[i] <- TRUE
+      textsplit[i] <- textsplit[i] %>% tolower()
+    }
+    
+    # insert typos
+    modification <- "none"
+    # Smaller chance of making a mistake when first of last character
+    if (i==1 | i==length(textsplit)){
+      prob <- typo_prob*first_last_character_prob_factor
+    } else{
+      prob <- typo_prob
+    }
+    
+    hazard <- rbinom(n=1, size=1, prob=prob) # if hazard==1, generate a typo
+    if (hazard){
+      modification <- sample(c('replace','add','remove','inverse')
+                             ,size=1
+                             ,prob=c(replace_prob, add_prob, remove_prob, inverse_prob))
+    }
+    
+    if (modification=="replace"){ # replace character with one that is close on the keyboard
+      textsplit[i] <- replace_character(textsplit[i])
+      position <- position + 1
+    }
+    else if (modification=="add"){ # add character with one close on the keyboard
+      textsplit[i] <- add_character(textsplit[i])
+      position <- position + 1
+    }
+    else if (modification=="remove"){ # remove character
+      textsplit[i] <- remove_character(textsplit[i])
+      # don't modify position because there is one less character
+      position <- position + 1
+    } 
+    else if (modification=="inverse"){ # inverse two characters
+      # if last character, inverse with the previous character
+      if (i==length(textsplit)){
+        new_characters <- inverse_character(textsplit[position], textsplit[position-1])
+        textsplit[i] <- new_characters[1]
+        textsplit[i-1] <- new_characters[2]
+      } 
+      else{ # if not last character, inverse with following character
+        new_characters <- inverse_character(textsplit[position], textsplit[position+1])
+        textsplit[i] <- new_characters[1]
+        textsplit[i+1] <- new_characters[2]
+      }
+      position <- position + 2
+    } 
+    else{ # modification == "none"
+      # do nothing
+      position <- position + 1
+    }
+
+    # Return to the original capitalization
+    if (capitalization[i]){
+      textsplit[i] = textsplit[i] %>% toupper()
+    }
+  
+    i <- position
+  }
+  
+  modified_text <- paste0(textsplit, collapse="")
+  return(modified_text)
+}
+
+generate_typos_vector <- function(texts, ...){
+  #' @param texts df. Must be a dataframe of texts, not a vector
+  
+  # for some reason, sapply() does not work, so I use apply with MARGIN=1 to 
+  # apply the function generate_typos on rows
+  if (!is.data.frame(texts)){
+    texts <- as.data.frame(texts)
+  }
+  to_return <- apply(X=texts
+                     ,FUN=generate_typos
+                     ,MARGIN=1
+                     , ...
+                    ) %>%
+    as.data.frame()
+  return(to_return)
+}
+
+degrade_texts_vector <- function(texts, 
+                             pos_to_keep=NULL,
+                             pos_to_remove=NULL,
+                             remove_stopwords=FALSE,
+                             lowercase=TRUE,
+                             typo_prob=0.01,
+                             first_last_character_prob_factor=0.5,
+                             replace_prob=0.25,
+                             add_prob=0.25,
+                             remove_prob=0.25,
+                             inverse_prob=0.25
+                             ){
+  
+  text_without_pos <- corrupt_texts(texts, 
+                          pos_to_keep=pos_to_keep, 
+                          pos_to_remove=pos_to_remove, 
+                          remove_stopwords=remove_stopwords,
+                          lowercase=lowercase) %>%
+    as.data.frame()
+  
+  text_without_pos_with_typos <- generate_typos_vector(text_without_pos
+                         ,typo_prob=typo_prob
+                         ,first_last_character_prob_factor=first_last_character_prob_factor
+                         ,replace_prob=replace_prob
+                         ,add_prob=add_prob
+                         ,remove_prob=remove_prob
+                         ,inverse_prob=inverse_prob) 
+  names(text_without_pos_with_typos) <- "modified_text"
+  
+  return(text_without_pos_with_typos)
+}
+```
+
+
+
+```{r}
+# if (!file.exists("./degraded_texts")){dir.create("./degraded_texts")}
+
+# set.seed(1)
+# corrupted_text_0typos <- degrade_texts_vector(texts=df$description_cased
+#                  #,pos_to_keep=NULL
+#                  ,pos_to_remove=c("NUM", "PRON", "PROPN", "DET")
+#                  ,remove_stopwords=FALSE
+#                  ,typo_prob=0
+#                  #,first_last_character_prob_factor=0.5
+#                  ,replace_prob=0.4
+#                  ,add_prob=0.3
+#                  ,remove_prob=0.15
+#                  ,inverse_prob=0.15)
+# colnames(corrupted_text_0typos) <- "corrupted_text_0typos"
+# write_feather(corrupted_text_0typos, "./degraded_texts/0typos.feather")
+# 
+# set.seed(1)
+# corrupted_text_5typos <- degrade_texts_vector(texts=df$description_cased
+#                  #,pos_to_keep=NULL
+#                  ,pos_to_remove=c("NUM", "PRON", "PROPN", "DET")
+#                  ,remove_stopwords=FALSE
+#                  ,typo_prob=0.05
+#                  #,first_last_character_prob_factor=0.5
+#                  ,replace_prob=0.4
+#                  ,add_prob=0.3
+#                  ,remove_prob=0.15
+#                  ,inverse_prob=0.15)
+# colnames(corrupted_text_5typos) <- "corrupted_text_5typos"
+# write_feather(corrupted_text_5typos, "./degraded_texts/5typos.feather")
+
+# set.seed(1)
+# corrupted_text_2_5typos <- degrade_texts_vector(texts=df$description_cased
+#                  #,pos_to_keep=NULL
+#                  ,pos_to_remove=c("NUM", "PRON", "PROPN", "DET")
+#                  ,remove_stopwords=FALSE
+#                  ,typo_prob=0.025
+#                  #,first_last_character_prob_factor=0.5
+#                  ,replace_prob=0.4
+#                  ,add_prob=0.3
+#                  ,remove_prob=0.15
+#                  ,inverse_prob=0.15)
+# colnames(corrupted_text_2_5typos) <- "corrupted_text_2.5typos"
+# write_feather(corrupted_text_2_5typos, "./degraded_texts/2_5typos.feather")
+
+# set.seed(1)
+# corrupted_text_10typos <- degrade_texts_vector(texts=df$description_cased
+#                  #,pos_to_keep=NULL
+#                  ,pos_to_remove=c("NUM", "PRON", "PROPN", "DET")
+#                  ,remove_stopwords=FALSE
+#                  ,typo_prob=0.1
+#                  #,first_last_character_prob_factor=0.5
+#                  ,replace_prob=0.4
+#                  ,add_prob=0.3
+#                  ,remove_prob=0.15
+#                  ,inverse_prob=0.15)
+# colnames(corrupted_text_10typos) <- "corrupted_text_10typos"
+# write_feather(corrupted_text_10typos, "./degraded_texts/10typos.feather")
+
+# corrupted_text_0typos <- read_feather("./degraded_texts/0typos.feather")
+# corrupted_text_5typos <- read_feather("./degraded_texts/5typos.feather")
+# corrupted_text_2_5typos <- read_feather("./degraded_texts/2_5typos.feather")
+ corrupted_text_10typos <- read_feather("./degraded_texts/10typos.feather")
+
+# df <- cbind(df, corrupted_text_0typos)
+# df <- cbind(df, corrupted_text_5typos)
+# df <- cbind(df, corrupted_text_2_5typos)
+df <- cbind(df, corrupted_text_10typos)
+```
+
+# Generate bert-base-uncased embeddings
+
+```{r}
+# in generate_embeddings.R, comment the line
+# ft_en <- fasttext$load_model('fastText/cc.en.300.bin')
+# to recude RAM usage
+source("generate_embeddings.R")
+# cwd <- getwd()
+# setwd("./embeddings")
+# if (!file.exists("./degraded_texts")){dir.create("./degraded_texts")}
+# setwd("./degraded_texts")
+# if (!file.exists("0typos")){dir.create("0typos")}
+# if (!file.exists("5typos")){dir.create("5typos")}
+# if (!file.exists("2_5typos")){dir.create("2_5typos")}
+# if (!file.exists("10typos")){dir.create("10typos")}
+# setwd(home_directory)
+
+
+# tokenizer and model have been loaded in
+df_bbu_degraded_texts_0typos <- df %>%
+  df_embeddings(., "corrupted_text_0typos", checkpoint='bert-base-uncased', truncation=TRUE)
+#write_feather(df_bbu_degraded_texts_0typos, "./embeddings/degraded_texts/0typos/df_bbu_degraded_texts_0typos.feather")
+```
+
+```{r}
+# tokenizer and model have been loaded in
+df_bbu_degraded_texts_5typos <- df %>%
+  df_embeddings(., "corrupted_text_5typos", checkpoint='bert-base-uncased', truncation=TRUE)
+#write_feather(df_bbu_degraded_texts_5typos, "./embeddings/degraded_texts/5typos/df_bbu_degraded_texts_5typos.feather")
+```
+
+```{r}
+## tokenizer and model have been loaded in
+df_bbu_degraded_texts_10typos <- df %>%
+  df_embeddings(., "corrupted_text_10typos", checkpoint='bert-base-uncased', truncation=TRUE)
+#write_feather(df_bbu_degraded_texts_10typos, "./embeddings/degraded_texts/10typos/df_bbu_degraded_texts_10typos.feather")
+```
+
+
+# Generate fasttext embeddings
+
+```{r}
+source("generate_embeddings.R")
+
+df_ft_degraded_texts_0typos <- df_embeddings(df, text="corrupted_text_0typos", checkpoint="fasttext")
+#write_feather(df_ft_degraded_texts_0typos, "./embeddings/degraded_texts/0typos/df_ft_degraded_texts_0typos.feather")
+
+df_ft_degraded_texts_5typos <- df_embeddings(df, text="corrupted_text_5typos", checkpoint="fasttext")
+#write_feather(df_ft_degraded_texts_5typos, "./embeddings/degraded_texts/5typos/df_ft_degraded_texts_5typos.feather")
+
+df_ft_degraded_texts_2_5typos <- df_embeddings(df, text="corrupted_text_2.5typos", checkpoint="fasttext")
+#write_feather(df_ft_degraded_texts_2_5typos, "./embeddings/degraded_texts/2_5typos/df_ft_degraded_texts_2_5typos.feather")
+
+df_ft_degraded_texts_10typos <- df_embeddings(df, text="corrupted_text_10typos", checkpoint="fasttext")
+#write_feather(df_ft_degraded_texts_10typos, "./embeddings/degraded_texts/10typos/df_ft_degraded_texts_10typos.feather")
+```
+
+# Remark
+What types of errors are in the real dataset but that I do not generate here?
+- Abreviations
+- Spelling mistakes (il avait -> il avais; coordonnees bancaires -> coordonnees bancaire)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Examples (not important)
+
+```{r}
+message = "Bonjour! Comment ca va aujourd'hui?"
+generate_typos(text=message, 
+               typo_prob=0.02,
+               replace_prob = 0.4,
+               add_prob = 0.3,
+               remove_prob = 0.15,
+               inverse_prob = 0.15)
+
+set.seed(2)
+generate_typos_vector(df[1:3,"description_cased"],
+               typo_prob=0.03,
+               replace_prob = 0.4,
+               add_prob = 0.3,
+               remove_prob = 0.15,
+               inverse_prob = 0.15
+               )
+```

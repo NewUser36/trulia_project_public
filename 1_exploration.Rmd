@@ -1,0 +1,1161 @@
+---
+title: "Exploratory data analysis"
+output:
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+header-includes:
+   - \usepackage{xcolor}
+   - \newcommand*{\red}[1]{\textcolor{red}{#1}}
+   - \newcommand*{\blue}[1]{\textcolor{blue}{#1}}
+---
+
+# Cleaning data
+
+```{r first-cleanup}
+################################
+# Packages and import datasets #
+################################
+# global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+# R packages
+library(tidyverse)
+library(magrittr) # use %$%
+library(survival)
+library(survminer)
+library(lubridate) # %--%
+library(tm) # tf-idf
+library(FactoMineR) # PCA
+library(factoextra)
+library(feather)
+library(riskRegression)
+library(pec) # pec, crps
+library(survAUC) # predErr
+
+# my "packages"
+source("generate_embeddings.R")
+# functions to generate embeddings with tf-idf, transformer and fasttext
+# function to put the embeddings in a dataframe
+
+'%not in%' <- Negate('%in%')
+
+#########################
+# dataset of sold homes #
+#########################
+
+dfsold <- read.csv(file.path(home_directory, "data", "sold", "df_final.csv"))
+str(dfsold)
+
+df_sold <- dfsold %>% 
+  select(-X) %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+     year_built = as.numeric(year_built)
+    ,bath = as.numeric(bath)
+    ,bed = as.numeric(bed)
+    ,living_area = as.numeric(living_area)
+    ,lot_area = as.numeric(lot_area)
+    ,listed_date = lubridate::date(listed_date)
+    ,sold_date = lubridate::date(sold_date)
+    ,event = 1
+  ) %>%
+  distinct() # remove duplicate rows
+
+# replace NAs with "No Info", which is already an existing category
+df_sold <- df_sold %>%
+  dplyr::mutate(
+    # replace NA with "No Info"
+     heating = ifelse(is.na(heating), "No Info", heating)
+    ,cooling = ifelse(is.na(cooling), "No Info", cooling)
+    ,parking = ifelse(is.na(parking), "No Info", parking)
+    ,outdoor = ifelse(is.na(outdoor), "No Info", outdoor)
+    ,pool = ifelse(is.na(pool), "No Info", pool)
+    ,type = ifelse(type=="Unknown" | is.na(type), "No Info", type)
+  )
+summary(df_sold)
+
+########################
+# Exploratory analysis #
+########################
+#### Missing values
+# There is nothing to do when listed_date or listed_price are NA, so I
+# delete the observation. There is not much to do when sold_price is NA,
+# so I also remove them.
+# Very few NAs for restaurants, groceries, nightlife, year_built => removed
+df_sold <- df_sold %>%
+  drop_na(c("listed_price", "sold_price", "restaurants", "groceries", 
+            "nightlife", "year_built"))
+summary(df_sold)
+
+# There is still a lot of NAs with bath, bed, living_area and lot_area.
+# I will do nothing now but I probably will have to remove or impute the dataset
+
+#### Analysis of prices
+
+# some homes have a high listed_price but very low sold_price...
+ggplot(df_sold) + 
+  geom_point(aes(x=listed_price, y=sold_price, color=listed_price/sold_price))
+
+df_sold %>%
+  subset(listed_price/sold_price >= 20, select=-c(description, description_cased)) %>%
+  arrange(sold_price) %>%
+  print()
+
+# I consider points with a high listed_price to sold_price ratio aberrant values
+# I will therefore delete them. These points seem to be related to houses
+# being on sale for a long time (listed_date < 2015)
+
+df_sold2 <- df_sold %>%
+  mutate(price_ratio = listed_price/sold_price) %>%
+  subset(price_ratio < 20)
+
+summary(df_sold2)
+
+ggplot(df_sold2) + 
+  geom_point(aes(x=listed_price, y=sold_price, color=price_ratio))
+
+# other very small values of sold_price compared to listed_price seem to come 
+# from the fact that the difference from listed_date and sold_date is high
+
+df_sold2 %>%
+  arrange(desc(price_ratio)) %>%
+  subset(select=-c(description, description_cased)) %>%
+  head(15)
+
+# In some cases, the opposite happens : old homes are sold for a lot more than
+# their initial price
+df_sold2 %>%
+  arrange(price_ratio) %>%
+  subset(select=-c(description, description_cased)) %>%
+  head(15)
+
+# I think it is fair to say there is a "dynamic" that our variables might
+# not be able to detect, hence the need for the description. This can be
+# a motivation for including texts in a regression model trying to predict
+# prices (even though we will instead try to predict time to sell).
+
+# Some "homes" are actually whole apartment buildings (for investors).
+# See below (df_censored) for more details.
+# I will keep these observations in the dataset, hoping the embeddings
+# will help the models will use this information for their predictions.
+
+
+#################
+# censored data #
+#################
+# Below, I do the same explanatory analysis as above, but for the censored dataset.
+
+dfcensored <- read.csv(file.path(home_directory, "data", "censored", "df_final.csv"))
+summary(dfcensored)
+
+#### format variables
+df_censored <- dfcensored %>%
+  select(-X) %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+    year_built = as.numeric(year_built),
+    bath = as.numeric(bath),
+    bed = as.numeric(bed),
+    living_area = as.numeric(living_area),
+    lot_area = as.numeric(lot_area),
+    listed_date = lubridate::date(listed_date),
+    sold_date = lubridate::date(sold_date),
+    event = 0
+  ) %>%
+  distinct() # remove duplicates
+df_censored %>% str()
+summary(df_censored)
+
+df_censored <- df_censored %>%
+  dplyr::mutate(
+    # replace NA with "No Info"
+     heating = ifelse(is.na(heating), "No Info", heating)
+    ,cooling = ifelse(is.na(cooling), "No Info", cooling)
+    ,parking = ifelse(is.na(parking), "No Info", parking)
+    ,outdoor = ifelse(is.na(outdoor), "No Info", outdoor)
+    ,pool = ifelse(is.na(pool), "No Info", pool)
+    ,type = ifelse(type=="Unknown" | is.na(type), "No Info", type)
+  ) %>%
+  # drop observation if listed_price, listed_date or year_built ==NA
+  # I also delete if NAs in other numeric variables for convenience...
+  drop_na(c("listed_price", "listed_date", "year_built", 
+            "groceries", "nightlife", "lot_area", "bed", "bath")) %>%
+  subset(., subset=year_built > 1200) # there is one obs. with year_built==1195
+
+summary(df_censored)
+
+#### extreme values for listed_price, lot_area, bath and beds
+ggplot(df_censored) +
+  geom_point(aes(x=listed_price, y=lot_area))
+
+ggplot(df_censored) +
+  geom_point(aes(x=bed, y=lot_area))
+
+ggplot(df_censored) +
+  geom_point(aes(x=bath, y=lot_area))
+
+ggplot(df_censored) +
+  geom_point(aes(x=bed, y=bath)) # makes sense
+
+df_censored %>%
+  subset(subset=(type=="Residential Income")) %>%
+  arrange(desc(bath)) %>%
+  select(!description_cased) %>%
+  head(10)
+
+# according to the description, many of these are bricks, and not a single 
+# house/apartment/condo/etc.
+# It is written in the description, therefore we can hope a model
+# with the description could be better at understanding that than a model
+# without it.
+# Therefore, I will not remove these observations.
+
+df_censored$price_ratio <- NA
+
+
+#### How big is the dataset if we delete NAs ?
+
+# censored data : already deleted NAs
+# sold homes : 
+df_sold_nona <- df_sold2 %>%
+  drop_na("bath", "bed", "lot_area")
+
+df <- rbind(df_censored, df_sold_nona) %>% mutate(obs = 1:nrow(.))
+
+
+###################################
+# survival analysis : exploration #
+###################################
+
+###############################
+# Other dataset modifications #
+###############################
+# Without removing NAs:
+# df <- rbind(df_censored, df_sold2)
+
+df$outdoor %>% table()
+df$parking %>% table()
+df$type %>% table(exclude=F)
+df$subtype %>% table(exclude=F) # won't use it in models
+# outdoor and parking :
+# too many categories, I will group every modality with a parking/outdoor 
+# to the value "Yes", otherwise "None" or "No Info"
+# type and subtype :
+# I won't use subtype, and I will try to regroup some categories of type.
+
+#### listed_price and sold_price
+
+# We will use listed_price/1000 to have more "grounded" coefficients.
+# I will also divide lot_area by 1000
+summary(df$listed_price)
+plot(df$listed_price)
+
+# Q: are there errors in dates?
+# A: there are 3 ties
+df %>%
+  subset(subset=(listed_date >= sold_date)) %>%
+  head()
+# there are 3 homes that I scraped on september 2nd that were listed on september 2nd, which produces a tie in start and end time. I will remove them.
+
+df <- df  %>%
+  mutate(
+    time = as.duration(listed_date %--% sold_date)/dmonths(1)
+    ,parking = ifelse(parking %in% c("No Info", "None"), parking, "Yes")
+    ,outdoor = ifelse(outdoor %in% c("No Info", "None"), outdoor, "Yes")
+    ,listed_price = listed_price/100000
+    ,lot_area = lot_area/1000
+  ) %>%
+  subset(subset=(listed_date < sold_date))
+
+#### lot_area
+# There are very small values of lot_area (sqrft)
+#TODO : what to do with them?
+
+#### Kaplan-Meier 
+df$event %>% table() %>% prop.table()
+
+# I don't think I can use counting process notation with Kaplan-Meier,
+# so I use the time alive in the following graph
+fit_km <- survfit(Surv(time, event) ~ 1, data = df)
+ggsurvplot(
+    fit = fit_km, 
+    xlab = "Months", 
+    ylab = "Overall survival probability",
+    title = "Kaplan-Meier estimator of home survival")
+
+#### Are there cases of complete separation?
+df %$% table(type, event, exclude=F) # YES
+df %$% table(cooling, event, exclude=F)
+df %$% table(heating, event, exclude=F)
+df %$% table(parking, event, exclude=F) # YES
+df %$% table(outdoor, event, exclude=F) # yes
+df %$% table(pool, event, exclude=F)
+
+# This WILL cause problem when estimating the cox model. 
+cox1 <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + bed + bath + year_built + lot_area + heating + cooling + type + parking + outdoor + pool + restaurants + groceries+ nightlife
+  , data=df
+)
+# To solve this issue, we can
+# 1. combine categories
+# 2. Remove variable
+# 3. Collect more data
+# I will start with option 1) and see what happens.
+
+df <- df %>%
+  mutate(
+    type = case_when(
+       type %in% c("Apartment", "Coop") ~ "apartment-coop"
+      ,type %in% c("Residential Additional", "Residential Income") ~ "residential-other"
+      ,type %in% c("Single Family Home", "Multi Family", "Townhouse") ~ "residential-other"
+      ,TRUE ~ type # else condition
+      )
+    #,cooling=#TODO regler le coolingNoInfo NA
+  )
+df %$% table(type, event, exclude=F) %>% prop.table()*100 # still a problem. I will not use this variable in the model.
+df %$% table(cooling, event, exclude=F) %>% prop.table()*100
+df %$% table(heating, event, exclude=F) %>% prop.table()*100
+df %$% table(parking, event, exclude=F) %>% prop.table()*100
+df %$% table(outdoor, event, exclude=F) %>% prop.table()*100
+df %$% table(pool, event, exclude=F) %>% prop.table()*100
+
+#TODO
+# might be problematic? The majority of observation with "No Info" weren't sold.
+
+#####################
+# Remove duplicates #
+#####################
+
+# there are a lot of duplicates which only differ from 1 or 2
+# restaurants-groceries-nightlife.
+duplicates <- df %>% 
+ group_by(description, year_built, listed_date, sold_date, listed_price, 
+          cooling, heating, parking, type,
+          lot_area, living_area, bath, bed) %>% 
+ filter(n()>1) %>%
+ arrange(description)
+# 25 > 6 : duplex therefore listed twice
+# 6934 > 6925 : same home
+# 7498 > 7476 : same home
+# 6878 > 6860 : same home (two family)
+# 6673 > 6662 : same home
+# 6102 > 6098 : same home
+
+# will have the index of the observations without the duplicates
+remove_duplicates_index <- df[c("description", "year_built", "listed_date", "sold_date", "listed_price", 
+          "cooling", "heating", "parking", "type",
+          "lot_area", "living_area", "bath", "bed")] %>%
+ duplicated()
+df_nodup_1 <- df[!remove_duplicates_index,]
+
+df3 <- df_nodup_1 %>%
+ group_by(description) %>%
+ filter(n()>1)
+
+# after manual review, a few obs. are similar to other ones. I'm 99% sure it is 
+# the same obs. but for some reason one has been listed as sold and the other
+# one hasn't (even though I scraped sold homes before censored homes).
+# The following is the house kept > house deleted
+# 7363 > 7352 : same home with more info
+# 6823 > 1123 : same home but 6823 is sold
+# 6844 > 3082 : same home but 6844 is sold (two family victorian)
+# 2237 > 1530 : same house with more info
+# 3674 > 4873 : same home with more info
+# 1630 > 590 : same infos except condo > residential-other and different resaurants & cie
+df_final <- df_nodup_1 %>%
+ subset(subset=(obs %not in% c(7352, 1123, 3082, 1530, 4873, 590)))
+df <- df_final
+df <- df %>% rename(num_bed=bed, num_bath=bath, I_outdoor=outdoor,
+                    I_pool=pool, I_heating=heating, I_type=type, 
+                    I_parking=parking, num_restaurants=restaurants,
+                    num_groceries=groceries, num_nightlife=nightlife,
+                    I_cooling=cooling, sale_time=time)
+
+##############################
+# homes on sale for too long #
+##############################
+# Somes homes have been on sale for 7+ years, which I find highly unprobable
+df %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+         ,select=-c(description, description_cased)) %>%
+  arrange(listed_date) %>%
+  head()
+
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+df_bbu %>%
+  subset(subset=(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        ) %>%
+  View()
+
+# Houses on sale for >20 months or that took more than 20 months to sell
+# are censored to 20 months
+
+# update (december 20th) : instead of removing them, I censor their survival
+# time at 20 months, as Thierry said I should do.
+# Therefore, in subsequent files (3_variable_selection_and_performance2 and 
+# corrupting_texts), remove these observations.
+
+df <- df %>%
+  mutate(
+    to_modify = case_when(sale_time > 20 ~ 1
+                          ,TRUE ~ 0 # else
+                          )
+    , event = case_when(to_modify == 1 ~ 0 # censoring events flagged as to_modify
+                       ,TRUE ~ event)
+    , sale_time = case_when(to_modify ==1 ~ 20 # sale_time forced to 20 months
+                            ,TRUE ~ sale_time)
+  )
+```
+
+# VIF
+```{r}
+library(car) # vif
+
+# I said I wouldn't use type...
+model1 <- lm(sale_time ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_cooling + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries + num_nightlife
+             , data=df)
+olsrr::ols_coll_diag(model1)
+# cooling is a problem, I won't use it
+
+model2 <- lm(sale_time ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries + num_nightlife
+             , data=df)
+olsrr::ols_coll_diag(model2)
+# colinearity between restaurants, groceries and nightlife. I'll remove nightlife
+
+model3 <- lm(sale_time ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries
+             , data=df)
+olsrr::ols_coll_diag(model3)
+# could be colinearity between restaurants and groceries...
+
+# CONCLUSION : shouldn't use the variables
+# I_type
+# I_cooling
+# num_nightlife
+```
+
+
+# Cox Model (first try)
+
+```{r}
+# We need to set t0. If we use as.numeric(sold_date), t0 is 1970-01-01 :
+lubridate::origin
+df$listed_date[1] - as.numeric(df$listed_date[1])
+
+cox1 <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries + I_type
+  , data=df
+)
+summary(cox1) # type is still a problem
+
+cox2 <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_cooling + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries
+  , data=df
+)
+summary(cox2)
+#TODO
+# Colinearity with coolingNo Info !!! 
+# I guess if heating is No Info, so is cooling, which could be a problem
+table(df$I_cooling, df$I_heating)
+
+# the "right" complete model is
+full <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ cooling
+  , data=df
+  , x=TRUE
+)
+summary(full)
+```
+
+
+
+# Train - test split
+```{r}
+train_valid_test <- function(df, id_column, p_train, p_valid, p_test=1-p_train-p_valid, type="stratified", random_seed=1){
+  #' Splits data in three parts (train, validation, test)
+  #'
+  #' @param df data.frame. The dataset 
+  #' @param id_column string. Variable on which we wish to split
+  #' @param p_train numeric. proportion of ids in training set, or approximative proportion of data for training
+  #' @param p_valid numeric. See p_train
+  #' @param type str. Façon dont les données sont séparées. "stratified" (default), "grouped" pour clustered or panel data
+  #' @param random_seed int. Seed used to randomly split data. Default is 1.
+  #'
+  #' @return \item{train}{data.frame. training set} \item{valid}{data.frame. validation set} \item{test}{data.frame. testing set}
+  
+  if(p_train + p_valid + p_test != 1){
+    stop("sum of probabilities must be 1")
+  }
+  
+  ids_split <- splitTools::partition(
+    #y = dplyr::pull(df[, id_column]), # pull nécessaire car pbc est un tibble
+    y = df[, id_column]
+    ,p = c(train = p_train, valid = p_valid, test = p_test)
+    ,type = type
+    ,seed = random_seed
+  )
+  
+  train <- df[ids_split$train, ]
+  valid <- df[ids_split$valid, ]
+  test <- df[ids_split$test, ]
+  
+  return(list(train=list(df=train, prop=nrow(train)/nrow(df)),
+              valid=list(df=valid, prop=nrow(valid)/nrow(df)),
+              test=list(df=test, prop=nrow(test)/nrow(df))
+              )
+         )
+}
+
+split <- train_valid_test(df, "event", p_train = 0.8, p_valid = 0.1)
+train <- split$train$df
+valid <- split$valid$df
+test <- split$test$df
+
+# After some thoughts, I don't think I will use a test set, so I will
+# merge valid and test to make a bigger validation set set
+test <- rbind(valid, test)
+rm(valid)
+```
+
+
+
+# Performance metrics (quick test)
+
+```{r}
+#TODO
+# NOT SURE IF WORKING!!!!
+# is it ok to use "times" if we have left-truncated data?????
+# according to the source code, IT IS NOT WOKRING
+# https://rdrr.io/cran/survAUC/src/R/surv_measures.R
+# because they use
+# stime <- Surv.rsp[,1] # e.g. 78.88295688 76.68172485+ 73.36344969
+# event <- Surv.rsp[,2] # e.g. 1 0 1
+# When we use Surv(time,time2,event)
+# Surv.rsp[,1] is time
+# Surv.rsp[,2] is time2
+# so it does not consider the censorship status...
+
+complete_train <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ cooling
+  , data=train
+  , x=TRUE
+)
+
+lp <- predict(complete_train)
+lpnew <- predict(complete_train, newdata=test)
+  
+Surv.rsp <- with(train, Surv(as.numeric(listed_date), as.numeric(sold_date), event))
+Surv.rsp.new <- with(test, Surv(as.numeric(listed_date), as.numeric(sold_date), event))
+# times <- 1:nrow(test)
+
+test %>% 
+  subset(select=c(listed_date, sold_date)) %>% 
+  mutate(listed_date = as.numeric(listed_date),
+         sold_date = as.numeric(sold_date)) %>%
+  summary()
+
+times <- 16504:18872 # not sure what to choose
+
+brier <- survAUC::predErr(Surv.rsp, Surv.rsp.new, lp, lpnew, times, 
+      type = "brier", int.type = "unweighted") # does not seem to work
+brier$ierror
+mean(brier$error, na.rm=T)
+
+performance_measures <- function(model, olddata, newdata, times){
+  lp <- predict(model)
+  lpnew <- predict(model, newdata=newdata)
+  
+  pattern <- "Surv\\((.*?)\\) ~"
+  model_call <- as.character(model$call)
+  call = str_extract(model_call, pattern)[2] %>%
+    substr(., start=1, stop=nchar(.)-2) # to remove " ~"
+
+  Surv.rsp <- with(olddata, eval(parse(text=call)))
+  Surv.rsp.new <- with(newdata, eval(parse(text=call)))
+  # times <- 1:nrow(test)
+  times <- times # not sure which one to choose
+  
+  brier <- survAUC::predErr(Surv.rsp, Surv.rsp.new, lp, lpnew, times, 
+        type = "brier", int.type = "unweighted") # does not seem to work
+
+  # survAUC::UnoC (might be working?)
+  # values can be in (0.5, 1)
+  Cstat <- survAUC::UnoC(Surv.rsp, Surv.rsp.new, lpnew)
+  
+  return(list(brier_score=brier
+              ,C_uno = Cstat
+              )
+         )
+}
+scores <- performance_measures(complete_train, train, test, 16504:18871)
+scores$brier$ierror
+# error : The prediction error estimates
+# ierror : The integrated prediction error <- more interesting
+```
+
+# Influential observation
+
+Some home have stayed a very long time on the market, and that could generate very high errors. I have already removed some outliers (see section the end of the "Cleaning data" section). But there can still be some influential/weird observations.
+
+```{r}
+tail(brier$error)
+```
+
+Are there influential observations?
+
+```{r}
+# on train set
+complete_train <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ cooling
+  , data=train
+  , x=TRUE
+)
+
+# deviance residuals :
+# A residual of high absolute value is indicative of an outlier. A positively 
+# valued deviance residual is indicative of an observation whereby the event 
+# occurred sooner than predicted; the converse is true for negatively valued 
+# residual.
+# https://stats.stackexchange.com/a/300620
+dfbetas_train <- residuals(complete_train, type="deviance")
+plot(dfbetas_train)
+
+# on all data
+complete_df <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ cooling
+  , data=df
+  , x=TRUE
+)
+
+dfbetas_df <- residuals(complete_df, type="deviance")
+plot(dfbetas_df)
+```
+
+Probably...
+
+# Exploring embeddings
+
+## Exploring tf-idf
+
+```{r explore-tfidf}
+my_stopwords <- c(tm::stopwords())
+df_tfidf <- df_embeddings(df, text="description_cased", 
+              checkpoint="tf-idf"
+              ,removeNumbers = FALSE 
+              ,removePunctuation = TRUE 
+              ,stripWhitespace = TRUE
+              ,stemming = TRUE
+              ,tolower = TRUE
+              ,stopwords = my_stopwords
+              ,language = 'en'
+              ,wordLengths = c(3,Inf) # this is the default
+              ,SparseTermsPercent = 1 # remove most words that appear only in 1-SparseTermsPercent of texts
+              )
+
+tfidf <- df_tfidf %>%
+  subset(select=-c(sold_date, sold_price, listed_date, listed_price, year_built, num_bath, num_bed, living_area, lot_area, I_heating, I_cooling, I_type, subtype, I_parking, I_outdoor, I_pool, num_restaurants, num_groceries, num_nightlife, description, description_cased, event, price_ratio, sale_time, obs))
+
+words <- colnames(tfidf)
+
+freq <- tfidf %>%
+  colSums() %>%
+  sort(., decreasing=T)
+
+# graph of token usage
+qplot(1:length(freq), freq, xlab ="TF-IDF rank", ylab="Sum over documents") + geom_line()
+# it goes down very quickly
+
+# 1000 most used words :
+#freq
+
+# difference between 100% and 99% of words :
+my_stopwords <- c(tm::stopwords())
+df_tfidf_99 <- df_embeddings(df %>% as.data.frame()
+              ,text="description_cased"
+              ,checkpoint="tf-idf"
+              ,removeNumbers = FALSE 
+              ,removePunctuation = TRUE 
+              ,stripWhitespace = TRUE
+              ,stemming = TRUE
+              ,tolower = TRUE
+              ,stopwords = my_stopwords
+              ,language = 'en'
+              ,wordLengths = c(3,Inf) # this is the default
+              ,SparseTermsPercent = 0.99 # PCA is harder when sparse is closer to
+              # 1, there 0.99 seems like a sweet spot on my computer... also
+              # there are less "junk words"
+              #,lower_IDF_quantile=0.15
+              ,low_document_frequency=1
+              )
+
+ncol(df_tfidf_99)
+ncol(df_tfidf)
+
+
+tfidf_99 <- df_tfidf_99 %>%
+  subset(select=-c(sold_date, sold_price, listed_date, listed_price, year_built, num_bath, num_bed, living_area, lot_area, I_heating, I_cooling, I_type, subtype, I_parking, I_outdoor, I_pool, num_restaurants, num_groceries, num_nightlife, description, description_cased, event, price_ratio, sale_time, obs))
+
+freq_99 <- tfidf_99 %>%
+  colSums() %>%
+  sort(., decreasing=T)
+
+# in terms of number of variable, this is a lot better. Although rare words
+# might help explain price/time to sell, most of them are just "junk words" :
+tail(freq, 15)
+tail(freq_99, 15)
+# most of the words still make sense (faã.ad???), compared to previously
+
+#################################
+# Visualize embeddings with PCA #
+#################################
+set.seed(1)
+tsne <-  tfidf_99 %>%
+  Rtsne::Rtsne(., dims=2 
+               ,check_duplicates=FALSE
+               ,perplexity=50 # default : 50
+               ,pca=TRUE)  # default : TRUE
+# perplexity and pca do not change the graph too much
+tsne_df <- data.frame(x=tsne$Y[,1], y=tsne$Y[,2], color=as.factor(df$event))
+ggplot(tsne_df) + 
+  geom_point(aes(x=x, y=y, color=color))
+# Error in Rtsne.default(X, ...) : Remove duplicates before running TSNE.
+# add argument "check_duplicates=FALSE"
+
+pca_tfidf_99 <- tfidf_99 %>%
+  PCA(., scale.unit = TRUE, graph = T)
+fviz_eig(pca_tfidf_99, addlabels=TRUE)
+
+ggplot(as.data.frame(pca_tfidf_99$eig), aes(y=`cumulative percentage of variance`, x=1:nrow(pca_tfidf_99$eig))) + 
+  geom_line() + 
+  geom_point(size=0.5)
+
+pca_tfidf_99 %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_tfidf_99$event)))
+
+cbind(df, pca_tfidf_99$ind$coord[,c(1,2)]) %>%
+  subset(subset=Dim.1 < 0 & Dim.2 < -7) %>%
+  subset(select=description) %>%
+  head(6)
+# the observation in the area all have the same type of description
+
+pca_tfidf_99 %$%
+  .$ind$coord[,c(1,3)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.3, color=as.factor(df_tfidf_99$event)))
+
+# variance of tf-idf
+summary(diag(var(tfidf_99)))
+
+pca_tfidf_99 <- tfidf_99 %>%
+  PCA(., scale.unit = FALSE, graph = T)
+fviz_eig(pca_tfidf_99, addlabels=TRUE)
+
+ggplot(as.data.frame(pca_tfidf_99$eig), aes(y=`cumulative percentage of variance`, x=1:nrow(pca_tfidf_99$eig))) + 
+  geom_line() + 
+  geom_point(size=0.5)
+
+pca_tfidf_99 %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_tfidf_99$event)))
+
+pca_tfidf_99 %$%
+  .$ind$coord[,c(1,3)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.3, color=as.factor(df_tfidf_99$event)))
+
+# theoretically, I shouldn't standardize variables since they 
+# use the same "unit of measurement".
+
+# save df
+#write_feather(df_tfidf_99, "embeddings/tfidf_99.feather")
+```
+
+## Exploring fasttext embeddings
+
+```{r explore-fasttext}
+df_ft <- df_embeddings(df, text="description_cased", checkpoint="fasttext")
+
+###########################################
+# Visualize embeddings with PCA           #
+# (not tsne because there are duplicates) #
+###########################################
+# tsne <-  df_ft %>%
+#   subset(select=V1:V300) %>%
+#   Rtsne::Rtsne(., dims=3) # perplexity=50
+# Error in Rtsne.default(X, ...) : Remove duplicates before running TSNE.
+
+pca_ft <- df_ft %>%
+  subset(select=ft1:ft300) %>%
+  PCA(., scale.unit = FALSE, graph = T)
+# no need to scale because all variables comme from the same representation
+
+fviz_eig(pca_ft, addlabels=TRUE)
+
+ggplot(as.data.frame(pca_ft$eig), aes(y=`cumulative percentage of variance`, x=1:nrow(pca_ft$eig))) + 
+  geom_line() + 
+  geom_point(size=0.5)
+
+pca_ft %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_ft$event)))
+
+0# save df
+#write_feather(df_ft, "embeddings/fasttext.feather")
+```
+
+
+
+
+
+
+# Generate transformer embeddings
+
+```{r}
+if (!file.exists("embeddings")){dir.create("embeddings")}
+# t1 <- Sys.time()
+# # tokenizer and model have been loaded in
+# df_bbu <- df %>%
+#   df_embeddings(., "description_cased", checkpoint='bert-base-uncased', truncation=TRUE)
+# t2 <- Sys.time()
+# t2-t1
+# write_feather(df_bbu, "embeddings/bert_base_uncased.feather")
+df_bbu <- read_feather("embeddings/bert_base_uncased.feather")
+df_bbu <- df_bbu %>%
+  subset(subset=!(lubridate::year(listed_date) <= 2014 & 
+                   lubridate::year(sold_date) >= 2021)
+        )
+```
+
+
+# Explore transformer embeddings
+```{r}
+checkpoint <- "bert-base-uncased"
+tokenizer <- transformers$BertTokenizer$from_pretrained(checkpoint)
+tokenized_length <- sapply(df$description, trf_count_length, tokenizer, USE.NAMES=FALSE)
+
+qplot(tokenized_length) + 
+  geom_vline(xintercept=512, color="red")
+
+# Since length of some (tokenized) texts is longer than the limit of 512 tokens,
+# we have different solutions available :
+# 1. truncate texts longer than 512 tokens
+# 1.1 what part of the text to truncate is another project on its own, but by
+#     default, the tokenizer only keeps the first 512 tokens
+# 1.2 If we have better performance with the corrupted text, it could be because
+#     without stop words/determinants, the model can see more of the text.
+#     This could, in my opinion, lead to a bias in our results.
+# 2. Use transformers that can use more than 512 tokens
+# 3. Split into subtexts and average the embeddings
+
+df_token <- cbind(df, tokenized_length)
+df_token %>%
+  subset(subset=tokenized_length>512) %$%
+  table(event)
+
+# Visualize transformer embeddings
+# without scaling
+pca_bbu <- df_bbu %>%
+  subset(select=V1:V728) %>%
+  PCA(., scale.unit = FALSE, graph = T)
+
+fviz_eig(pca_bbu, addlabels=TRUE)
+
+ggplot(as.data.frame(pca_bbu$eig), aes(y=`cumulative percentage of variance`, x=1:nrow(pca_bbu$eig))) + 
+  geom_line() + 
+  geom_point(size=0.5)
+
+pca_bbu %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_bbu$event)))
+
+# with scaling
+pca_bbu <- df_bbu %>%
+  subset(select=V1:V728) %>%
+  PCA(., scale.unit = TRUE, graph = T)
+
+fviz_eig(pca_bbu, addlabels=TRUE)
+
+ggplot(as.data.frame(pca_bbu$eig), aes(y=`cumulative percentage of variance`, x=1:nrow(pca_bbu$eig))) + 
+  geom_line() + 
+  geom_point(size=0.5)
+
+pca_bbu %$%
+  .$ind$coord[,c(1,2)] %>%
+  as.data.frame() %>%
+  ggplot(.) + 
+    geom_point(aes(x=Dim.1, y=Dim.2, color=as.factor(df_bbu$event)))
+
+# The results are somewhat similar with or without scaling. The graphic of
+# the two first principal component is similar to what we got with tf-idf and
+# and fasttext. That being said, the % of explained variance is higher for
+# a lower number of dimension, which is good.
+```
+
+# Prediction performance metrics 
+
+```{r performance-measures}
+full <- coxph(
+  Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ I_cooling
+  , data=train
+)
+summary(full)
+
+#### prediction performance (full model)
+
+##### R2
+
+r2 <- 1 - exp(2/full$nevent*(full$loglik[1] - full$loglik[2]))
+r2max <- 1 - exp(2/full$nevent*(full$loglik[1]))
+r2scaled <- r2/r2max
+
+##### C index (concordance index)
+
+# Unfortunately, Harrell's c [concordance index or C-index] is also less sensitive than the above statistics, so you may not want to choose between models based on it if the difference between them is small; it's more useful as an interpretable index of general performance than a way to compare different models. (source : https://stats.stackexchange.com/a/133877)
+
+# This is the value of the C index on the TRAIN DATA
+full$concordance["concordance"] # summary(cox_train)$concordance[1]
+full$concordance["std"] # summary(cox_train)$concordance[2]
+# we want to assess performance on the validation set
+
+# C INDEX ON TRAIN SET
+# before computing on the validation set, I try a few different methods to compute the C-index on the test set. If it gives the same result as concordance, it must be doing the computations correctly.
+
+# method 1
+# https://stats.stackexchange.com/a/48369
+estimates = predict(full, newdata=train, type="lp") # type=risk yields the same C-index 
+#estimates
+1-Hmisc::rcorr.cens(x = estimates, S=Surv(train$sale_time, train$event))[1] # not sure why I have to do 1- rcorr.cens to get correct value
+
+# method 1.1
+# does it work with counting process notation (cpn)?
+full_cpn <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ I_cooling
+  , data=train
+)
+
+estimates = predict(full_cpn, newdata=train, type="lp") # type=risk yields the same C-index 
+#1-Hmisc::rcorr.cens(x = estimates, S=Surv(as.numeric(train$listed_date), as.numeric(train$sold_date), train$event))[1]
+#TODO NOT WORKING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# method 2
+# https://bioconductor.org/packages/release/bioc/html/survcomp.html
+if (!requireNamespace("BiocManager", quietly = TRUE)){install.packages("BiocManager")}
+# BiocManager::install("survcomp")
+
+# https://www.rdocumentation.org/packages/survcomp/versions/1.22.0/topics/concordance.index
+survcomp::concordance.index(estimates, surv.time=train$sale_time, surv.event=train$event)$c.index
+# not exactly the right value
+
+# method 3
+# https://stats.stackexchange.com/questions/234164/how-to-validate-cox-proportional-hazards-model
+survConcordance(Surv(train$sale_time, train$event) ~ predict(full, newdata=train), data=train)
+# right value, but deprecated
+
+# method 4
+# https://stats.stackexchange.com/a/400761
+full_cph <- rms::cph(Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife
+  , data=train
+  ,x=TRUE
+  , y=TRUE
+  , surv=TRUE
+  )
+full_cph$stats['Dxy']/2+0.5 # Dxy = 2*(C-1/2)
+# proche de la bonne valeur
+
+c_index <- function(model, data){
+  #' Computes C index of a cox model on new data
+  #'
+  #' @param model Trained coxph model
+  #' @param data Dataset on which to compute concordance
+  #'
+  #' @return \item{C Index}{concordance index}
+  
+  estimates <- predict(model, newdata=data, type="lp")
+  
+  pattern <- "Surv\\((.*?)\\)"
+  model_call <- as.character(model$call)[2]
+  call = str_extract(model_call, pattern)
+  
+  # S = Surv(time, event)
+  S = with(data, eval(parse(text=call)))
+  
+  return(1-Hmisc::rcorr.cens(x=estimates, S=S)[1])
+}
+# quick verification :
+concordance(full)$concordance == c_index(full, train)
+c_index(full, test) # performance very similar to train...
+```
+
+
+```{r, include=F, eval=F}
+# Prediction Error
+# https://rdrr.io/cran/survAUC/man/predErr.html
+TR <- ovarian[1:16,]
+TE <- ovarian[17:26,]
+train.fit  <- coxph(Surv(futime, fustat) ~ age, x=TRUE, y=TRUE, 
+                    method="breslow", data=TR)
+
+lp <- predict(train.fit)
+lpnew <- predict(train.fit, newdata=TE)
+Surv.rsp <- Surv(TR$futime, TR$fustat)
+Surv.rsp.new <- Surv(TE$futime, TE$fustat)
+times <- 1:500                  
+
+# Uno C 
+# https://rdrr.io/cran/survAUC/man/UnoC.html
+
+# according to the source code, IT IS NOT WOKRING
+# https://rdrr.io/cran/survAUC/src/R/surv_measures.R
+# because they use
+# stime <- Surv.rsp[,1] # e.g. 78.88295688 76.68172485+ 73.36344969
+# event <- Surv.rsp[,2] # e.g. 1 0 1
+# When we use Surv(time,time2,event)
+# Surv.rsp[,1] is time
+# Surv.rsp[,2] is time2
+# so it does not consider the censorship status...
+predErr(Surv.rsp, Surv.rsp.new, lp, lpnew, times, 
+        type = "brier", int.type = "unweighted")
+Cstat <- UnoC(Surv.rsp, Surv.rsp.new, lpnew)
+Cstat
+
+# integrated brier score (might be working?)
+full <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife #+ cooling
+  , data=train
+  , x=TRUE
+)
+
+not_much <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ restaurants + groceries+ nightlife #+ cooling
+  , data=train
+  , x=TRUE
+)
+
+lp <- predict(full)
+lpnew <- predict(full, newdata=test)
+Surv.rsp <- Surv(as.numeric(train$listed_date), as.numeric(train$sold_date), train$event)
+Surv.rsp.new <- Surv(as.numeric(test$listed_date), as.numeric(test$sold_date), test$event)
+# times <- 1:nrow(test)
+times <- 18500:18870 # not sure which one to choose
+# is it ok to use "times" of we have left=truncated data???????
+
+# according to the source code, IT IS NOT WOKRING
+# https://rdrr.io/cran/survAUC/src/R/surv_measures.R
+# because they use
+# stime <- Surv.rsp[,1] # e.g. 78.88295688 76.68172485+ 73.36344969
+# event <- Surv.rsp[,2] # e.g. 1 0 1
+# When we use Surv(time,time2,event)
+# Surv.rsp[,1] is time
+# Surv.rsp[,2] is time2
+# so it does not consider the censorship status...
+survAUC::predErr(Surv.rsp, Surv.rsp.new, lp, lpnew, times, 
+        type = "brier", int.type = "unweighted") # does not seem to work
+
+# survAUC::UnoC (might be working?)
+Cstat <- survAUC::UnoC(Surv.rsp, Surv.rsp.new, lpnew)
+Cstat # values can be in (0.5, 1)
+
+# Integrated Brier score with pec (not working)
+Models <- list(
+  "full"=coxph(
+    Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife
+    , data=train,
+    x=TRUE),
+  "not_much"=coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ num_restaurants + num_groceries+ num_nightlife
+  , data=train
+  , x=TRUE
+  )
+)
+
+pec(Models
+    , formula = Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife # "For right censored data, 
+    # the right hand side of the formula is used to specify conditional
+    # censoring models". I'm pretty sure it is not ok to use time here since
+    # we have left-truncated data. 
+    , data=train 
+    , cens.model="cox"
+)
+
+# Brier plot (not working)
+full <- coxph(
+  Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries+ num_nightlife
+  , data=train
+  , x=TRUE
+)
+
+not_much <- coxph(
+  Surv(as.numeric(listed_date), as.numeric(sold_date), event) ~ restaurants + groceries+ nightlife #+ cooling
+  , data=train
+  , x=TRUE
+)
+
+xscore <- riskRegression::Score(list(full, not_much),formula=Surv(as.numeric(listed_date), as.numeric(sold_date), event)~1, data=train,times=18500:18872,metrics="brier")
+# data : data.frame or data.table in which the formula can be interpreted.
+# does this mean we cannot use test set with this function???
+
+# Upper limit of followup is 18871
+# Results at evaluation time(s) beyond this time point are not computed.
+# Warning messages:
+# 1: In predictCox(object = object, newdata = newdata, times = times,  :
+#   The current version of predictCox was not designed to handle left censoring 
+# The function may be used on own risks 
+# 
+# 2: In predictCox(object = object, newdata = newdata, times = times,  :
+#   The current version of predictCox was not designed to handle left censoring 
+# The function may be used on own risks 
+riskRegression::plotBrier(xscore)
+
+xscore <- riskRegression::Score(list(full, not_much),formula=Surv(as.numeric(listed_date), as.numeric(sold_date), event)~1, data=train,times=18500:18872,metrics="brier")
+riskRegression::plotBrier(xscore)
+```
+
+\red{Functions do not seem to be able to deal with left-truncated data!!!!!!!! The only functions that might work are survAUC::predErr and survAUC::UnoC, but the documentation is unclear if it is ok to use with counting process models...}
+
+#### Performance measure options :
+There are a few packages that can be used to assess the performance of a Cox model. Unfortunately, most often than not, these packages can only use cox models with right-censored data, and cannot handle left-truncation. It is therefore not so easy to compare performance of different models. Here are the options :
+
+1. Concordance index on train set
+2. Uno's C index (not sure if the code I have really works)
+3. log-likelihood and C-index from glmnet (make sure I use the same seed when comparing different models)
+4. Integrated Brier score? (https://stats.stackexchange.com/questions/341692/inconsistent-results-calculating-the-integrated-brier-score-in-r)
+
+"Waiting to be sold" uses 5-fold cross-validation and the performance measure is the C-index.
+
+#### Coxnet (variable selection)
+Other possibility : Left-truncated regression tree (https://cran.r-project.org/web/packages/LTRCtrees/vignettes/LTRCtrees.html, https://academic.oup.com/biostatistics/article/18/2/352/2739324) or Left-truncated regression forest (https://cran.r-project.org/web/packages/LTRCforests/LTRCforests.pdf, https://arxiv.org/pdf/2006.00567.pdf). In practice, LTRF take a while to run and I can't get variable importance.
+
+#### Prediction performance after variable selection
+
+##############
+# influential observations
+# residuals(type=dfbetas) -> voir cours EPM
+
+#######################
+#### Adding text with tf-idf
+##### variable selection
+##### performance
+
+#### adding text with fasttext
+##### variable selection
+##### performance
+
+#### adding text with transformers
+##### variable selection
+##### performance
+```
+

@@ -1,0 +1,4 @@
+- original_texts : comparaison des performances de tous les modèles avec les données structurées et les textes originaux
+- original_texts_only : comparaison des performances de tous les modèles avec les textes originaux, sans les données structurées
+- bert_300vs61 : comparaison des modèles de type bert avec textes seulement. Objectif : est-ce qu'il est mieux d'utiliser 300 variables ou le nombre de variables nécessaires pour avoir 80% de la variabilité suite à une ACP sur les 768 embeddings de BERT? 80% de la variabilité dans cette situation était expliqué par 61 composantes principales. Les modèles sont construits avec les textes seulement.
+- modeles_bidons : modèles bidon générés afin de voir les performances minimales avec le jeu de données. Le modèle bidon 1 est un modèle avec un mot qui n'a pas trop de sens (X1000), et le modèle 2 est un modèle avec une seule variable, le nombre de restaurants.

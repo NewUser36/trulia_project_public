@@ -1,0 +1,300 @@
+---
+title: "variable_selection_and_performance2_2"
+output:
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+# Setup
+
+```{r}
+# global variables
+home_directory <- "~/trulia_project"
+setwd(home_directory)
+
+set.seed(1)
+
+# R packages
+library(tidyverse); library(magrittr); library(survival); library(survminer); library(lubridate); library(tm); library(FactoMineR); library(factoextra); library(feather); library(riskRegression); library(pec); library(survAUC); library(glmnet); library(plotmo)
+# magrittr : use %$%
+# lubridate : %--%
+# tm : tf-idf
+# FactoMineR : PCA
+# pec : pec, crps
+# survAUC : predErr
+# plotmo : plot_glmnet
+
+# My functions
+source("utils.R")
+source('generate_embeddings.R')
+'%not in%' <- Negate('%in%')
+
+# glmnet hyperparameters
+glmnet.control(mxitnr=50)
+
+################
+# Python setup #
+################
+reticulate::use_python("~/anaconda3/envs/r_nlp2/bin/python", required=TRUE)
+
+####################
+# Prepare datasets #
+####################
+#TODO: import the right datasets
+df_ft <- read_feather("embeddings/degraded_texts/10typos/df_ft_degraded_texts_10typos.feather")
+
+df <- df_ft %>%
+  select(!c(ft1:ft300, corrupted_text_10typos))
+
+############
+# Datasets #
+############
+
+# Create tf-idf dataset
+my_stopwords <- c(tm::stopwords())
+#TODO : change column "text" to appropriate column
+df_tfidf_99_lowIDF15 <- df_embeddings(df %>% as.data.frame()
+                       ,text="description_cased"
+                       ,checkpoint="tf-idf"
+                       ,removeNumbers = FALSE 
+                       ,removePunctuation = TRUE 
+                       ,stripWhitespace = TRUE
+                       ,stemming = TRUE
+                       ,tolower = TRUE
+                       ,stopwords = my_stopwords
+                       ,language = 'en'
+                       ,wordLengths = c(3,Inf) # this is the default
+                       ,SparseTermsPercent = 0.99 # remove most words that appear only in 1-SparseTermsPercent of texts
+                       ,normalize_tfidf = TRUE
+                       ,lower_IDF_quantile=0.15
+                       ,low_document_frequency=1
+                       )
+
+df <- df_tfidf_99_lowIDF15
+
+# Houses on sale for >20 months or that took more than 20 months to sell
+# are censored to 20 months
+df <- df %>%
+  mutate(
+    to_modify = case_when(sale_time > 20 ~ 1
+                          ,TRUE ~ 0 # else
+                          )
+    , event = case_when(to_modify == 1 ~ 0 # censoring events flagged as to_modify
+                       ,TRUE ~ event)
+    , sale_time = case_when(to_modify ==1 ~ 20 # sale_time forced to 20 months
+                            ,TRUE ~ sale_time)
+  )
+# before censoring events that took too long, there were 1567 events. After
+# censoring at 20 months, there where 1537 events (20% of the dataset).
+
+# REMARK : 
+# For the function extract_nonzero_coeff to work, variables treated as
+# factors must be transformed as factor here
+df <- df %>%
+  mutate(
+    # format baths, beds, lot_area, etc
+     year_built = as.numeric(year_built)
+    ,num_bath = as.numeric(num_bath)
+    ,num_bed = as.numeric(num_bed)
+    ,living_area = as.numeric(living_area)
+    ,lot_area = as.numeric(lot_area)
+    ,listed_date = lubridate::date(listed_date)
+    ,sold_date = lubridate::date(sold_date)
+    ,I_heating = as.factor(I_heating)
+    ,I_cooling = as.factor(I_cooling)
+    ,I_parking = as.factor(I_parking)
+    ,I_outdoor = as.factor(I_outdoor)
+    ,I_pool = as.factor(I_pool)
+    ,I_type = as.factor(I_type)
+    ,event = as.numeric(event)
+  ) %>%
+  # need to have no spaces in categories for regex
+  mutate(
+    I_heating = recode(I_heating, "No Info" = "No_Info")
+    , I_cooling = recode(I_cooling, "No Info" = "No_Info")
+    , I_parking = recode(I_parking, "No Info" = "No_Info")
+    , I_outdoor = recode(I_outdoor, "No Info" = "No_Info") 
+    , I_pool = recode(I_pool, "No Info" = "No_Info")
+    , I_type = recode(I_type, "No Info" = "No_Info")
+  )
+
+# train-test-split
+split <- train_valid_test(df, "event", p_train = 0.8, p_valid = 0.1)
+train <- split$train$df
+valid <- split$valid$df
+test <- split$test$df
+
+# After some thoughts, I don't think I will use a test set, so I will
+# merge valid and test to make a bigger validation set set
+test <- rbind(valid, test)
+rm(valid)
+```
+
+# About lambda.min.ratio
+
+A parameter used in glmnet controls the amount of lambda tested, therefore the number of models tested in cross-validation. I recommend not changing this parameter, except if 1) glmnet clearly does not explore enough values of lambda (when models with only 0, 1 or 2 variables are tested), if 2) if it takes too long to compute cross-validation without specifying lambda.min.ratio or if 3) the model does not converge with too many variables (sometimes, using a smaller value of lambda yields more models tested, and a model with more variables is selected, but when computing the new model with the selected variables (without regularization), it does not converge. Values I used before were 0.1e-50 and 0.1e-25. A greater value means more lambdas are tested, so computation will take more time. 
+
+# Structured data + Texts
+
+## full model
+```{r}
+##############
+# full model #
+##############
+full <- coxph(
+  Surv(sale_time, event) ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries
+  , data=train
+  , x=TRUE # for glmnet
+  , model=TRUE # for glmnet
+)
+summary(full)
+
+performance_measures(full, train, test)
+```
+
+
+## tfidf
+
+```{r}
+words <- colnames(df_tfidf_99_lowIDF15)[27:length(colnames(df_tfidf_99_lowIDF15))]
+
+# as shown in the appendix, I can extract the design matrix that needs to be
+# given to glmnet using a linear model. I do this because there are too many
+# variables to adjust the model for coxph
+formula_lr <- as.formula(paste("event ~ listed_price + num_bed + num_bath + year_built + lot_area + I_heating + I_parking + I_outdoor + I_pool + num_restaurants + num_groceries +", paste(words, collapse="+", sep="")))
+
+linear <- lm(formula_lr, data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # sparse to generate smaller matrix
+yss <- with(train, Surv(sale_time, event))
+
+t1 <- Sys.time()
+cv_tfidf99_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-10 # reduced to give more values of lambda tested but with a smaller compute time
+               )
+Sys.time() - t1
+plot(cv_tfidf99_Cindex)
+#TODO
+# before december 19th, the model chosen with Cindex was the same than the 
+# one chosen with loglikelihood. As of december 19th, I don't know why,
+# but there is an error (convergence or something related to a parameter in
+# glmnet that takes value Nan/Inf).
+# Error in elnet.fit(x, z, w, lambda, alpha, intercept = FALSE, thresh = thresh,  : 
+# NA/NaN/Inf in foreign function call (arg 12)
+
+
+variables_names <- c("listed_price", "num_bed", "num_bath", "year_built", "lot_area", "I_heating", "I_parking", "I_outdoor", "I_pool", "num_restaurants", "num_groceries")
+score_cox_tfidf99_regularized_Cindex <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_Cindex
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+#TODO : convergence issues because there are too many variables
+# all the convergence problems come from the function validate because it creates
+# a bootstrap sample of the train set which makes convergence more difficult
+# for example, 28/200 samples generate non convergent coefficients
+
+# code, flip and zip are problematic, especially flip
+
+cv_tfidf99_loglik <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25
+               ) # many convergence issues
+plot(cv_tfidf99_loglik)
+
+score_cox_tfidf99_regularized_loglik <- performance_newcox_glmnet(cvglmnet = cv_tfidf99_loglik
+                      ,variables_names=variables_names
+                      ,embedding_names=words
+                      ,dataset=train
+                      ,dataset_test = test
+                      ,surv_call="Surv(sale_time, event)"
+                      )
+# before december 19th, this model and the one made with Cindex were the same.
+# after december 19th, the model with Cindex does not converge...
+```
+
+## Scores
+
+```{r}
+score_cox_tfidf99_regularized_Cindex$scores # convergence warnings
+score_cox_tfidf99_regularized_loglik$scores # convergence warnings
+```
+
+# Text only
+
+## tfidf
+
+```{r}
+# I can extract the design matrix that needs to be
+# given to glmnet using a linear model. I do this because there are too many
+# variables to adjust the model for coxph
+#formula_lr <- as.formula(paste("event ~ ", paste(words, collapse="+", sep="")))
+
+linear <- lm(as.formula(paste("event ~ ", paste(words, collapse="+", sep=""))), data=train)
+design_matrix <- model.matrix(linear)[,-1] %>% # [,-1] to remove (Intercept)
+  Matrix::Matrix(., sparse=TRUE) # generate smaller matrix
+yss <- with(train, Surv(sale_time, event))
+
+text_cv_tfidf99_Cindex <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="C"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25 # 25 instead of 50 gives more lambdas tested
+               )
+plot(text_cv_tfidf99_Cindex)
+
+variables_names <- c("")
+score_text_tfidf99_regularized_Cindex <- performance_newcox_glmnet(
+  cvglmnet = text_cv_tfidf99_Cindex
+  ,variables_names=variables_names
+  ,embedding_names=words
+  ,dataset=train
+  ,dataset_test = test
+  ,surv_call="Surv(sale_time, event)"
+  )
+
+text_cv_tfidf99_loglik <- cv.glmnet(x=design_matrix, y=yss, family="cox"
+               , nfolds = 5
+               , type.measure="default"
+               , alpha=0.95
+               , trace.it = FALSE
+               #, lambda.min.ratio = 0.1e-25
+               )
+plot(text_cv_tfidf99_loglik)
+
+score_text_tfidf99_regularized_loglik <- performance_newcox_glmnet(
+  cvglmnet = text_cv_tfidf99_loglik
+  ,variables_names=variables_names
+  ,embedding_names=words
+  ,dataset=train
+  ,dataset_test = test
+  ,surv_call="Surv(sale_time, event)"
+                      )
+
+# can't run without regularization :
+# text_tfidf <- paste("Surv(sale_time, event) ~ ", paste(words, collapse="+", sep="")) %>%
+#   as.formula() %>%
+#   coxph(data=train)
+```
+
+## Scores
+
+```{r}
+score_text_tfidf99_regularized_Cindex$scores
+score_text_tfidf99_regularized_loglik$scores
+```
